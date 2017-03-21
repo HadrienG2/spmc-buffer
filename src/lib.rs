@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::ops::BitAnd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -30,16 +31,15 @@ impl<T: Clone> SPMCBuffer<T> {
     /// concurrent readouts to distinct buffers, and with some initial content.
     pub fn new(max_conc_readers: usize, initial: T) -> Self {
         // Translate max_conc_readers into an actual buffer count
-        assert!(max_conc_readers > 0);
         let num_buffers = max_conc_readers + 2;
 
         // Start with the shared state...
         let shared_state = Arc::new(
             SPMCBufferSharedState {
-                storage: vec![
+                buffers: vec![
                     Buffer {
                         data: UnsafeCell::new(initial),
-                        done_readers: AtomicRefcount::new(0),
+                        done_readers: AtomicRefCount::new(0),
                     };
                     num_buffers
                 ],
@@ -47,7 +47,9 @@ impl<T: Clone> SPMCBuffer<T> {
             }
         );
 
-        // ...then construct the input and output structs
+        // ...then construct the input and output structs. Any consumer should
+        // be initialized with an invalid read index so that it increments the
+        // refcount of the latest buffer on its first read.
         let mut result = SPMCBuffer {
             input: SPMCBufferInput {
                 shared: shared_state.clone(),
@@ -55,7 +57,7 @@ impl<T: Clone> SPMCBuffer<T> {
             },
             output: SPMCBufferOutput {
                 shared: shared_state,
-                read_idx: INVALID_INDEX,
+                shared_read_idx: INVALID_SHARED_INDEX,
             },
         };
 
@@ -85,20 +87,63 @@ pub struct SPMCBufferInput<T: Clone> {
     shared: Arc<SPMCBufferSharedState<T>>,
 
     /// Amount of readers who potentially have access to each buffer.
-    /// The latest buffer has a maximal reference count to clarify that its
+    /// The latest buffer has an infinite reference count to clarify that its
     /// actual number of readers is unknown and potentially very high.
-    reference_counts: Vec<Refcount>,
+    reference_counts: Vec<RefCount>,
 }
+//
+impl<T: Clone> SPMCBufferInput<T> {
+    /// Write a new value into the SPMC buffer
+    pub fn write(&mut self, value: T) {
+        // Access the shared state
+        let ref shared_state = *self.shared;
 
-// TODO: Writer algorithm:
-//          - We know which buffer is the latest buffer, and shouldn't touch it
-//          - Scan private list of other buffers' read counts, to find a buffer
-//            whose readers are all done (readcount = donereads)
-//          - Write new data into this "safe" buffer, which has no readers
-//          - When done, swap latest_idx with the latest buffer's index and
-//            a readcount of zero
-//          - Check if read count overflow occured, and if so panic
-//          - Otherwise, memorize the old read count in our private list
+        // Go into a spin-loop, looking for an "old" buffer with no live reader
+        let mut write_pos: Option<usize> = None;
+        while write_pos == None {
+            // We want to iterate over both buffers and associated refcounts
+            let mut buf_rc_iter =
+                shared_state.buffers.iter()
+                                    .zip(self.reference_counts.iter());
+
+            // We want to find an unreachable buffer in which all readers are
+            // gone. We are guaranteed not to find the latest buffer here
+            // because its reference count is set to an "infinite" value.
+            write_pos = buf_rc_iter.position(|tuple| {
+                let (buffer, refcount) = tuple;
+                let done_readers = buffer.done_readers.load(Ordering::Relaxed);
+                done_readers == *refcount
+            });
+        }
+        let write_idx = write_pos.unwrap();
+
+        // The buffer that we just obtained is provably unused by any reader and
+        // unreachable by new readers, so we can safely use it as a write
+        // buffer and put our data in it
+        let write_ptr = shared_state.buffers[write_idx].data.get();
+        unsafe { *write_ptr = value; }
+
+        // Publish our write buffer as the new latest buffer, and retrieve
+        // the old buffer's shared index
+        let former_latest_buf = shared_state.latest_buf.swap(
+            write_idx * SHARED_INDEX_MULTIPLIER,
+            Ordering::Release  // Publish all buffer updates to the readers
+        );
+
+        // In debug mode, make sure that overflow did not occur
+        debug_assert!(former_latest_buf.bitand(SHARED_OVERFLOW_BIT) == 0);
+
+        // Decode the information contained in the former shared index
+        let former_idx = former_latest_buf.bitand(SHARED_INDEX_MASK)
+                                          / SHARED_INDEX_MULTIPLIER;
+        let former_readcount = former_latest_buf.bitand(SHARED_READCOUNT_MASK);
+
+        // Write down the former buffer's refcount, and set the latest buffer's
+        // refcount to infinity so that we don't accidentally write to it
+        self.reference_counts[former_idx] = former_readcount;
+        self.reference_counts[write_idx] = UNKNOWN_REFCOUNT;
+    }                      
+}
 
 
 /// Consumer interface to SPMC buffers
@@ -112,22 +157,68 @@ pub struct SPMCBufferOutput<T: Clone> {
     /// Reference-counted shared state
     shared: Arc<SPMCBufferSharedState<T>>,
 
-    /// Index of the buffer which the consumer is currently reading from
-    read_idx: BufferIndex,
+    /// Index of the buffer which the consumer is currently reading from,
+    /// in the shared-index format corresponding to a reader count of zero
+    shared_read_idx: SharedIndex,
 }
+//
+impl<T: Clone> SPMCBufferOutput<T> {
+    /// Access the latest value from the SPMC buffer. This invalidates any
+    /// previously emitted SPMCRef, so make sure that you drop these before
+    /// calling read() again. Or else this function will panic in your face.
+    pub fn read(&mut self) -> SPMCRef<Self> {
+        // Access the shared state
+        let ref shared_state = *self.shared;
 
-// TODO: Reader algorithm:
-//          - Keep track of the last buffer we've read
-//          - Relaxed-check the latest_buf AtomicSharedIdx to see if a new
-//            buffer is available
-//          - If not, we're done, otherwise drop our buffer
-//          - Fetch-add the latest_buf AtomicSharedIdx to acquire a new buffer
-//          - Check if read count overflow occured, and if so panic
-//          - Extract buffer ID
-//          - Provide a buffer smart-ref that allows required read access
-//          - When the smart-ref is dropped, increment buffer's done-read count
-//              (Decrementing the readcount is unsafe because the writer may
-//              have commited an update to latest_idx meanwhile)
+        // Check if the producer has submitted an update
+        let init_latest_buf = shared_state.latest_buf.load(Ordering::Relaxed);
+        let update_available =
+            init_latest_buf.bitand(SHARED_INDEX_MASK) != self.shared_read_idx;
+
+        // If so, exchange our current read buffer with the latest buffer
+        if update_available {
+            // Start by dropping our current read buffer...
+            let read_idx = self.shared_read_idx / SHARED_INDEX_MULTIPLIER;
+            shared_state.buffers[read_idx].done_readers.fetch_add(
+                1,
+                Ordering::Relaxed
+            );
+
+            // ...then acquire access to the latest buffer, incrementing its
+            // refcount to tell the producer that we have access to it
+            let latest_buf = shared_state.latest_buf.fetch_add(
+                1,
+                Ordering::Acquire  // Synchronize with buffer updates
+            );
+
+            // In debug mode, make sure that overflow did not occur
+            debug_assert!((latest_buf+1).bitand(SHARED_OVERFLOW_BIT) == 0);
+
+            // Extract the index of our new read buffer
+            self.shared_read_idx = latest_buf.bitand(SHARED_INDEX_MASK);
+        }
+
+        // Access data from the current (read-only) read buffer
+        let read_idx = self.shared_read_idx / SHARED_INDEX_MULTIPLIER;
+        let read_ptr = shared_state.buffers[read_idx].data.get();
+        SPMCRef::new(self, unsafe { &*read_ptr })
+        
+        // TODO: Make sure that we automatically drop the current read buffer
+        //       on thread exit by returning a smart reference which does that
+        //          + Make sure that a reader that reads twice without dropping
+        //            the smart-reference first gets appropriate punishment.
+    }
+}
+//
+impl<T: Clone> Clone for SPMCBufferOutput<T> {
+    // Create a new reader associated with a given SPMC buffer
+    fn clone(&self) -> Self {
+        SPMCBufferOutput {
+            shared: self.shared.clone(),
+            shared_read_idx: INVALID_SHARED_INDEX,
+        }
+    }
+}
 
 
 /// Shared state for SPMC buffers
@@ -140,11 +231,11 @@ pub struct SPMCBufferOutput<T: Clone> {
 /// usage. An SPMC buffer is provably wait-free for both readers and writers if
 /// N >= Nreaders + 2, where Nreaders is the amount of data consumers, but it
 /// can work correctly in a degraded regime which is wait-free for readers and
-/// potentially blocking for writers as long as N >= 3.
+/// potentially blocking for writers as long as N >= 2.
 ///
 struct SPMCBufferSharedState<T: Clone> {
     /// Data storage buffers
-    storage: Vec<Buffer<T>>,
+    buffers: Vec<Buffer<T>>,
 
     /// Combination of reader count and latest buffer index (see below)
     latest_buf: AtomicSharedIndex,
@@ -155,7 +246,7 @@ struct Buffer<T: Clone> {
     data: UnsafeCell<T>,
 
     /// Amount of readers who are done with this buffer and switched to another
-    done_readers: AtomicRefcount,
+    done_readers: AtomicRefCount,
 }
 //
 impl<T: Clone> Clone for Buffer<T> {
@@ -168,7 +259,7 @@ impl<T: Clone> Clone for Buffer<T> {
             data: UnsafeCell::new(
                 unsafe { (*self.data.get()).clone() }
             ),
-            done_readers: AtomicRefcount::new(
+            done_readers: AtomicRefCount::new(
                 self.done_readers.load(Ordering::Relaxed)
             ),
         }
@@ -226,19 +317,17 @@ impl<T: Clone> Clone for Buffer<T> {
 ///
 /// TODO: Switch to U16 / AtomicU16 once the later is stable
 ///
-type BufferIndex = usize;
-const INVALID_INDEX: usize = 0xffff;
+type RefCount = usize;
+const UNKNOWN_REFCOUNT: RefCount = 0xffff;
+type AtomicRefCount = AtomicUsize;
 //
-type Refcount = usize;
-const UNKNOWN_REFCOUNT: usize = 0xffff;
-//
-type AtomicRefcount = AtomicUsize;
-//
+type SharedIndex = usize;
 type AtomicSharedIndex = AtomicUsize;
-const SHARED_READCOUNT_MASK:   usize = 0b0000_0001_1111_1111; // < 512 readers
-const SHARED_OVERFLOW_BIT:     usize = 0b0000_0010_0000_0000;
-const SHARED_INDEX_MASK:       usize = 0b1111_1100_0000_0000; // <= 64 buffers
-const SHARED_INDEX_MULTIPLIER: usize = 0b0000_0100_0000_0000;
+const SHARED_READCOUNT_MASK:   SharedIndex = 0b0000_0001_1111_1111;
+const SHARED_OVERFLOW_BIT:     SharedIndex = 0b0000_0010_0000_0000;
+const SHARED_INDEX_MASK:       SharedIndex = 0b1111_1100_0000_0000;
+const SHARED_INDEX_MULTIPLIER: SharedIndex = 0b0000_0100_0000_0000;
+const INVALID_SHARED_INDEX:    SharedIndex = 0b1111_1111_1111_1111;
 
 
 // TODO: Add tests
