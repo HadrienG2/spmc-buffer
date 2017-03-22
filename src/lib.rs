@@ -385,13 +385,13 @@ mod tests {
     /// requested amount of concurrent readers stays in implementation limits.
     #[test]
     fn initial_state() {
-        // Test for 0 readers (double-buffering limit)
+        // Test for 0 readers (writer-blocking double-buffering limit)
         test_initialization(0);
 
         // Test for 1 concurrent reader (quadruple buffering)
         test_initialization(1);
 
-        // Test for maximal amount of readers
+        // Test for maximal amount of concurrent readers
         test_initialization(::MAX_CONCURRENT_READERS);
     }
 
@@ -402,10 +402,11 @@ mod tests {
     fn too_many_readers() {
         test_initialization(::MAX_CONCURRENT_READERS+1);
     }
-
-    // TODO: Check that (sequentially) writing to an SPMC buffer works
-    // TODO: Check that (sequentially) reading from an SPMC buffer works, for
-    //       any amount of concurrent readers
+    
+    // TODO: Check that writing in a new SPMC buffer works
+    // TODO: Check that reading from a new SPMC buffer works
+    // TODO: Check other write/read scenarios (think about possible code paths)
+    // TODO: Check that spawning a new reader and using itworks
     // TODO: Check that the writer waits for readers if needed
     // TODO: Check that concurrent reads and writes work
 
@@ -414,36 +415,40 @@ mod tests {
         // Create a buffer with the requested wait-free read concurrency
         let buf = ::SPMCBuffer::new(wf_conc_readers, 42);
 
-        // Access the shared state and decode the latest-buffer information
+        // Access the shared state
         let ref buf_shared = *buf.input.shared;
-        let latest_info = buf_shared.latest_info.load(Ordering::Relaxed);
-        let reader_count = latest_info.bitand(::SHARED_READCOUNT_MASK);
-        let overflow = latest_info.bitand(::SHARED_OVERFLOW_BIT) != 0;
-        let latest_idx = latest_info.bitand(::SHARED_INDEX_MASK)
-                                    / ::SHARED_INDEX_MULTIPLIER;
 
         // Check that we have an appropriate amount of buffers
         let num_buffers = buf_shared.buffers.len();
         assert_eq!(num_buffers, 2*wf_conc_readers + 2);
 
-        // Check the latest buffer metadata: one reader, no overflow, and
-        // latest buffer index is in range.
+        // Decode and check the latest buffer metadata: we should have one
+        // reader, no refcount overflow, and a valid latest buffer index
+        let latest_info = buf_shared.latest_info.load(Ordering::Relaxed);
+        let reader_count = latest_info.bitand(::SHARED_READCOUNT_MASK);
         assert_eq!(reader_count, 1);
+        let overflow = latest_info.bitand(::SHARED_OVERFLOW_BIT) != 0;
         assert!(!overflow);
+        let latest_idx = latest_info.bitand(::SHARED_INDEX_MASK)
+                                    / ::SHARED_INDEX_MULTIPLIER;
         assert!(latest_idx < num_buffers);
 
-        // Reader must initially point towards the latest index
+        // The reader must initially use the latest buffer as a read buffer
         assert_eq!(buf.output.read_idx, latest_idx);
 
-        // Read buffer must be properly initialized
-        let ref read_buffer = buf_shared.buffers[latest_idx];
-        let read_ptr = read_buffer.data.get();
-        let done_readers = read_buffer.done_readers.load(Ordering::Relaxed);
+        // The read buffer must be properly initialized
+        let ref buffers = buf_shared.buffers;
+        let read_ptr = buffers[latest_idx].data.get();
         assert_eq!(unsafe { *read_ptr }, 42);
-        assert_eq!(done_readers, 0);
 
-        // Writer must not be able to write in the read buffer, and must be able
-        // to write in every other buffer.
+        // The outgoing reader count of each buffer must be 0 initially.
+        for buffer in buffers {
+            assert_eq!(buffer.done_readers.load(Ordering::Relaxed), 0);
+        }
+
+        // Every buffer except for the read buffer should be considered free
+        // in the writer's internal reference counting records. The read buffer
+        // should use a special infinite refcount to completely forbid writing.
         for tuple in buf.input.reader_counts.iter().enumerate() {
             let (index, refcount) = tuple;
             if index != latest_idx {
