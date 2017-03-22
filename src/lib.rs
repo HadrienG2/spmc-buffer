@@ -29,7 +29,7 @@ pub struct SPMCBuffer<T: Clone> {
 //
 impl<T: Clone> SPMCBuffer<T> {
     /// Construct an SPMC buffer allowing for wait-free writes under up to N
-    /// concurrent readouts to distinct versions
+    /// concurrent readouts to distinct buffer versions
     pub fn new(wf_read_concurrency: usize, initial: T) -> Self {
         // Check that the amount of readers fits implementation limits
         assert!(wf_read_concurrency <= MAX_CONCURRENT_READERS);
@@ -38,7 +38,7 @@ impl<T: Clone> SPMCBuffer<T> {
         let num_buffers = 2 + 2*wf_read_concurrency;
 
         // Create the shared state. Buffer 0 is initially considered the latest,
-        // with one reader accessing it (corresponding to a refcount of 1).
+        // and has one reader accessing it (corresponding to a refcount of 1).
         let shared_state = Arc::new(
             SPMCBufferSharedState {
                 buffers: vec![
@@ -48,7 +48,7 @@ impl<T: Clone> SPMCBuffer<T> {
                     };
                     num_buffers
                 ],
-                latest_buf: AtomicSharedIndex::new(1),
+                latest_info: AtomicSharedIndex::new(1),
             }
         );
 
@@ -137,18 +137,18 @@ impl<T: Clone> SPMCBufferInput<T> {
 
         // Publish our write buffer as the new latest buffer, and retrieve
         // the old buffer's shared index
-        let former_latest_buf = shared_state.latest_buf.swap(
+        let former_latest_info = shared_state.latest_info.swap(
             write_idx * SHARED_INDEX_MULTIPLIER,
             Ordering::Release  // Publish updated buffer state to the readers
         );
 
         // In debug mode, make sure that overflow did not occur
-        debug_assert!(former_latest_buf.bitand(SHARED_OVERFLOW_BIT) == 0);
+        debug_assert!(former_latest_info.bitand(SHARED_OVERFLOW_BIT) == 0);
 
         // Decode the information contained in the former shared index
-        let former_idx = former_latest_buf.bitand(SHARED_INDEX_MASK)
-                                          / SHARED_INDEX_MULTIPLIER;
-        let former_readcount = former_latest_buf.bitand(SHARED_READCOUNT_MASK);
+        let former_idx = former_latest_info.bitand(SHARED_INDEX_MASK)
+                                           / SHARED_INDEX_MULTIPLIER;
+        let former_readcount = former_latest_info.bitand(SHARED_READCOUNT_MASK);
 
         // Write down the former buffer's refcount, and set the latest buffer's
         // refcount to infinity so that we don't accidentally write to it
@@ -180,16 +180,16 @@ impl<T: Clone> SPMCBufferOutput<T> {
         let ref shared_state = *self.shared;
 
         // Check if the producer has submitted an update
-        let latest_buf = shared_state.latest_buf.load(Ordering::Relaxed);
+        let latest_info = shared_state.latest_info.load(Ordering::Relaxed);
         let update_available =
-            latest_buf.bitand(SHARED_INDEX_MASK)
+            latest_info.bitand(SHARED_INDEX_MASK)
                 != self.read_idx * SHARED_INDEX_MULTIPLIER;
 
         // If so, exchange our current read buffer with the latest buffer
         if update_available {
             // Acquire access to the latest buffer, incrementing its
             // refcount to tell the producer that we have access to it
-            let latest_buf = shared_state.latest_buf.fetch_add(
+            let latest_info = shared_state.latest_info.fetch_add(
                 1,
                 Ordering::Acquire  // Fetch the associated buffer state
             );
@@ -200,11 +200,11 @@ impl<T: Clone> SPMCBufferOutput<T> {
             unsafe { self.discard_read_buffer(Ordering::Relaxed); }
 
             // In debug mode, make sure that overflow did not occur
-            debug_assert!((latest_buf+1).bitand(SHARED_OVERFLOW_BIT) == 0);
+            debug_assert!((latest_info+1).bitand(SHARED_OVERFLOW_BIT) == 0);
 
             // Extract the index of our new read buffer
-            self.read_idx = latest_buf.bitand(SHARED_INDEX_MASK)
-                                      / SHARED_INDEX_MULTIPLIER;
+            self.read_idx = latest_info.bitand(SHARED_INDEX_MASK)
+                                       / SHARED_INDEX_MULTIPLIER;
         }
 
         // Access data from the current (read-only) read buffer
@@ -228,14 +228,14 @@ impl<T: Clone> Clone for SPMCBufferOutput<T> {
         let shared_state = self.shared.clone();
 
         // Acquire access to the latest buffer, incrementing its refcount
-        let latest_buf = shared_state.latest_buf.fetch_add(
+        let latest_info = shared_state.latest_info.fetch_add(
             1,
             Ordering::Acquire  // Fetch the associated buffer state
         );
 
         // Extract the index of this new read buffer
-        let new_read_idx = latest_buf.bitand(SHARED_INDEX_MASK)
-                                     / SHARED_INDEX_MULTIPLIER;
+        let new_read_idx = latest_info.bitand(SHARED_INDEX_MASK)
+                                      / SHARED_INDEX_MULTIPLIER;
 
         // Build a new output interface from this information
         SPMCBufferOutput {
@@ -279,7 +279,7 @@ struct SPMCBufferSharedState<T: Clone> {
     buffers: Vec<Buffer<T>>,
 
     /// Combination of reader count and latest buffer index (see below)
-    latest_buf: AtomicSharedIndex,
+    latest_info: AtomicSharedIndex,
 }
 //
 struct Buffer<T: Clone> {
@@ -378,6 +378,9 @@ const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS/2 - 1;
 /// Unit tests
 #[cfg(test)]
 mod tests {
+    use std::ops::BitAnd;
+    use std::sync::atomic::Ordering;
+
     /// Check that SPMC buffers are properly initialized as long as the
     /// requested amount of concurrent readers stays in implementation limits.
     #[test]
@@ -407,10 +410,31 @@ mod tests {
     // TODO: Check that concurrent reads and writes work
 
     /// Try initializing a buffer for some maximal wait-free readout concurrency
-    fn test_initialization(wf_concurrent_readers: usize) {
+    fn test_initialization(wf_conc_readers: usize) {
         // Create a buffer with the requested wait-free read concurrency
-        let _ = ::SPMCBuffer::new(wf_concurrent_readers, 42);
-        // TODO: Check that the buffer was properly initialized
+        let buf = ::SPMCBuffer::new(wf_conc_readers, 42);
+
+        // Access the shared state and decode the latest-buffer information
+        let ref buf_shared = *buf.input.shared;
+        let latest_info = buf_shared.latest_info.load(Ordering::Relaxed);
+        let reader_count = latest_info.bitand(::SHARED_READCOUNT_MASK);
+        let overflow = latest_info.bitand(::SHARED_OVERFLOW_BIT) != 0;
+        let latest_idx = latest_info.bitand(::SHARED_INDEX_MASK)
+                                    / ::SHARED_INDEX_MULTIPLIER;
+
+        // Check that we have an appropriate amount of buffers
+        let num_buffers = buf_shared.buffers.len();
+        assert_eq!(num_buffers, 2*wf_conc_readers + 2);
+
+        // Check the latest buffer metadata: one reader, no overflow, and
+        // latest buffer index is in range.
+        assert_eq!(reader_count, 1);
+        assert!(!overflow);
+        assert!(latest_idx < num_buffers);
+
+        // TODO: Check buffer contents
+        // TODO: Check reader and writer structs
+        unimplemented!();
     }
 }
 
