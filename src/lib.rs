@@ -573,11 +573,10 @@ mod tests {
             writer.join().unwrap();
         }
     }
-    
-    // TODO: Check that writing in a new SPMC buffer works
-    // TODO: Check that reading from a new SPMC buffer works
+
+    // TODO: Check that reading from an SPMC buffer works
     // TODO: Check other write/read scenarios (think about possible code paths)
-    // TODO: Check that spawning a new reader and using itworks
+    // TODO: Check that spawning a new reader and using it works
     // TODO: Check that the writer waits for readers if needed
     // TODO: Check that concurrent reads and writes work
 
