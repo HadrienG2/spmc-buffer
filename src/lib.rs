@@ -36,22 +36,19 @@ impl<T: Clone + PartialEq + Send> SPMCBuffer<T> {
         assert!(wf_read_concurrency <= MAX_CONCURRENT_READERS);
 
         // Translate wait-free read concurrency into an actual buffer count
-        let num_buffers = 2 + 2*wf_read_concurrency;
+        let num_buffers = 2 * (1 + wf_read_concurrency);
 
         // Create the shared state. Buffer 0 is initially considered the latest,
         // and has one reader accessing it (corresponding to a refcount of 1).
-        let shared_state = Arc::new(
-            SPMCBufferSharedState {
-                buffers: vec![
-                    Buffer {
-                        data: UnsafeCell::new(initial),
-                        done_readers: AtomicRefCount::new(0),
-                    };
-                    num_buffers
-                ],
-                latest_info: AtomicSharedIndex::new(1),
-            }
-        );
+        let shared_state =
+            Arc::new(SPMCBufferSharedState {
+                         buffers: vec![Buffer {
+                                           data: UnsafeCell::new(initial),
+                                           done_readers: AtomicRefCount::new(0),
+                                       };
+                                       num_buffers],
+                         latest_info: AtomicSharedIndex::new(1),
+                     });
 
         // ...then construct the input and output structs
         let mut result = SPMCBuffer {
@@ -85,9 +82,7 @@ impl<T: Clone + PartialEq + Send> Clone for SPMCBuffer<T> {
     fn clone(&self) -> Self {
         // Clone the shared state. This is safe because at this layer of the
         // interface, one needs an Input/Output &mut to mutate the shared state.
-        let shared_state = Arc::new(
-            unsafe { (*self.input.shared).clone() }
-        );
+        let shared_state = Arc::new(unsafe { (*self.input.shared).clone() });
 
         // ...then the input and output structs
         SPMCBuffer {
@@ -107,9 +102,8 @@ impl<T: Clone + PartialEq + Send> PartialEq for SPMCBuffer<T> {
     fn eq(&self, other: &Self) -> bool {
         // Compare the shared states. This is safe because at this layer of the
         // interface, one needs an Input/Output &mut to mutate the shared state.
-        let shared_states_equal = unsafe {
-            (*self.input.shared).eq(&*other.input.shared)
-        };
+        let shared_states_equal =
+            unsafe { (*self.input.shared).eq(&*other.input.shared) };
 
         // Compare the rest of the triple buffer states
         shared_states_equal &&
@@ -150,18 +144,19 @@ impl<T: Clone + PartialEq + Send> SPMCBufferInput<T> {
         while write_pos == None {
             // We want to iterate over both buffers and associated refcounts
             let mut buf_rc_iter =
-                shared_state.buffers.iter()
-                                    .zip(self.reader_counts.iter());
+                shared_state.buffers.iter().zip(self.reader_counts.iter());
 
             // We want to find a buffer which is unreachable, and whose previous
             // readers have all moved on to more recent data. We identify
             // unreachable buffers by having previously tagged the latest buffer
             // with an infinite reference count.
-            write_pos = buf_rc_iter.position(|tuple| {
-                let (buffer, refcount) = tuple;
-                let done_readers = buffer.done_readers.load(Ordering::Relaxed);
-                done_readers == *refcount
-            });
+            write_pos =
+                buf_rc_iter.position(|tuple| {
+                                        let (buffer, refcount) = tuple;
+                                        *refcount == 
+                                        buffer.done_readers
+                                              .load(Ordering::Relaxed)
+                                     });
         }
         let write_idx = write_pos.unwrap();
 
@@ -170,7 +165,9 @@ impl<T: Clone + PartialEq + Send> SPMCBufferInput<T> {
         // buffer and put our new data into it
         let ref write_buffer = shared_state.buffers[write_idx];
         let write_ptr = write_buffer.data.get();
-        unsafe { *write_ptr = value; }
+        unsafe {
+            *write_ptr = value;
+        }
 
         // No one has read this version of the buffer yet, so we reset all
         // reference-counting information to zero.
@@ -187,15 +184,15 @@ impl<T: Clone + PartialEq + Send> SPMCBufferInput<T> {
         debug_assert!(former_latest_info.bitand(SHARED_OVERFLOW_BIT) == 0);
 
         // Decode the information contained in the former shared index
-        let former_idx = former_latest_info.bitand(SHARED_INDEX_MASK)
-                                           / SHARED_INDEX_MULTIPLIER;
+        let former_idx = former_latest_info.bitand(SHARED_INDEX_MASK) /
+                         SHARED_INDEX_MULTIPLIER;
         let former_readcount = former_latest_info.bitand(SHARED_READCOUNT_MASK);
 
         // Write down the former buffer's refcount, and set the latest buffer's
         // refcount to infinity so that we don't accidentally write to it
         self.reader_counts[former_idx] = former_readcount;
         self.reader_counts[write_idx] = INFINITE_REFCOUNT;
-    }                      
+    }
 }
 
 
@@ -223,9 +220,8 @@ impl<T: Clone + PartialEq + Send> SPMCBufferOutput<T> {
 
         // Check if the producer has submitted an update
         let latest_info = shared_state.latest_info.load(Ordering::Relaxed);
-        let update_available =
-            latest_info.bitand(SHARED_INDEX_MASK)
-                != self.read_idx * SHARED_INDEX_MULTIPLIER;
+        let update_available = latest_info.bitand(SHARED_INDEX_MASK) !=
+                               (self.read_idx * SHARED_INDEX_MULTIPLIER);
 
         // If so, drop our current read buffer and go with the latest buffer
         if update_available {
@@ -239,14 +235,16 @@ impl<T: Clone + PartialEq + Send> SPMCBufferOutput<T> {
             // Drop our current read buffer. Because we already used an acquire
             // fence above, we can safely use relaxed atomic order here: no CPU
             // or compiler will reorder this operation before the fence.
-            unsafe { self.discard_read_buffer(Ordering::Relaxed); }
+            unsafe {
+                self.discard_read_buffer(Ordering::Relaxed);
+            }
 
             // In debug mode, make sure that overflow did not occur
-            debug_assert!((latest_info+1).bitand(SHARED_OVERFLOW_BIT) == 0);
+            debug_assert!((latest_info + 1).bitand(SHARED_OVERFLOW_BIT) == 0);
 
             // Extract the index of our new read buffer
-            self.read_idx = latest_info.bitand(SHARED_INDEX_MASK)
-                                       / SHARED_INDEX_MULTIPLIER;
+            self.read_idx = latest_info.bitand(SHARED_INDEX_MASK) /
+                            SHARED_INDEX_MULTIPLIER;
         }
 
         // Access data from the current (read-only) read buffer
@@ -276,8 +274,8 @@ impl<T: Clone + PartialEq + Send> Clone for SPMCBufferOutput<T> {
         );
 
         // Extract the index of this new read buffer
-        let new_read_idx = latest_info.bitand(SHARED_INDEX_MASK)
-                                      / SHARED_INDEX_MULTIPLIER;
+        let new_read_idx = latest_info.bitand(SHARED_INDEX_MASK) /
+                           SHARED_INDEX_MULTIPLIER;
 
         // Build a new output interface from this information
         SPMCBufferOutput {
@@ -292,7 +290,9 @@ impl<T: Clone + PartialEq + Send> Drop for SPMCBufferOutput<T> {
     fn drop(&mut self) {
         // We must use release ordering here in order to prevent preceding
         // buffer reads from being reordered after the buffer is discarded
-        unsafe { self.discard_read_buffer(Ordering::Release); }
+        unsafe {
+            self.discard_read_buffer(Ordering::Release);
+        }
     }
 }
 
@@ -300,7 +300,8 @@ impl<T: Clone + PartialEq + Send> Drop for SPMCBufferOutput<T> {
 /// Shared state for SPMC buffers
 ///
 /// This struct provides both a set of shared buffers for single-producer
-/// multiple-consumer broadcast communication and 
+/// multiple-consumer broadcast communication and a way to know which of these
+/// buffers contains the most up to date data with reader reference counting.
 ///
 /// The number of buffers N is a design tradeoff: the larger it is, the more
 /// robust the primitive is against contention, at the cost of increased memory
@@ -341,21 +342,20 @@ impl<T: Clone + PartialEq + Send> SPMCBufferSharedState<T> {
     /// no one is concurrently accessing the triple buffer to avoid data races.
     unsafe fn eq(&self, other: &Self) -> bool {
         // Determine whether the contents of all buffers are equal
-        let buffers_equal =
-            self.buffers.iter()
-                        .zip(other.buffers.iter())
-                        .all(|tuple| -> bool {
-                            let (buf1, buf2) = tuple;
-                            let dr1 = buf1.done_readers.load(Ordering::Relaxed);
-                            let dr2 = buf2.done_readers.load(Ordering::Relaxed);
-                            (*buf1.data.get() == *buf2.data.get())
-                                && (dr1 == dr2)
-                        });
+        let buffers_equal = self.buffers
+            .iter()
+            .zip(other.buffers.iter())
+            .all(|tuple| -> bool {
+                     let (buf1, buf2) = tuple;
+                     let dr1 = buf1.done_readers.load(Ordering::Relaxed);
+                     let dr2 = buf2.done_readers.load(Ordering::Relaxed);
+                     (*buf1.data.get() == *buf2.data.get()) && (dr1 == dr2)
+                 });
 
         // Use that to deduce if the entire shared state is equivalent
-        buffers_equal
-            && (self.latest_info.load(Ordering::Relaxed)
-                == other.latest_info.load(Ordering::Relaxed))
+        buffers_equal &&
+        (self.latest_info.load(Ordering::Relaxed) ==
+         other.latest_info.load(Ordering::Relaxed))
     }
 }
 //
@@ -379,12 +379,9 @@ impl<T: Clone + PartialEq + Send> Clone for Buffer<T> {
     ///          a lot more painful.
     fn clone(&self) -> Self {
         Buffer {
-            data: UnsafeCell::new(
-                unsafe { (*self.data.get()).clone() }
-            ),
-            done_readers: AtomicRefCount::new(
-                self.done_readers.load(Ordering::Relaxed)
-            ),
+            data: UnsafeCell::new(unsafe { (*self.data.get()).clone() }),
+            done_readers: AtomicRefCount::new(self.done_readers
+                                                  .load(Ordering::Relaxed)),
         }
     }
 }
@@ -453,8 +450,8 @@ const SHARED_OVERFLOW_BIT:     SharedIndex = 0b0000_0010_0000_0000;
 const SHARED_INDEX_MASK:       SharedIndex = 0b1111_1100_0000_0000;
 const SHARED_INDEX_MULTIPLIER: SharedIndex = 0b0000_0100_0000_0000;
 //
-const MAX_BUFFERS: usize = SHARED_INDEX_MASK/SHARED_INDEX_MULTIPLIER + 1;
-const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS/2 - 1;
+const MAX_BUFFERS: usize = SHARED_INDEX_MASK / SHARED_INDEX_MULTIPLIER + 1;
+const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS / 2 - 1;
 
 
 /// Unit tests
@@ -485,7 +482,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn too_many_readers() {
-        test_initialization(::MAX_CONCURRENT_READERS+1);
+        test_initialization(::MAX_CONCURRENT_READERS + 1);
     }
 
     /// Check that writing to an SPMC buffer works, but can be blocking
@@ -511,7 +508,9 @@ mod tests {
             let old_read_idx = old_buf.output.read_idx;
             let write_idx = 1 - old_read_idx;
             let write_ptr = expected_shared.buffers[write_idx].data.get();
-            unsafe { *write_ptr = 4.2; }
+            unsafe {
+                *write_ptr = 4.2;
+            }
 
             // We expect the latest buffer information to now point towards
             // this write buffer
@@ -541,17 +540,16 @@ mod tests {
             // Send a thread on a suicide mission to write into the buffer
             let (mut buf_input, mut buf_output) = buf.split();
             let writer = thread::spawn(move || {
-                *writer_sync.0.lock().unwrap() = 1;
-                buf_input.write(2.4);
-                *writer_sync.0.lock().unwrap() = 2;
-                writer_sync.1.notify_all();
-            });
+                                           *writer_sync.0.lock().unwrap() = 1;
+                                           buf_input.write(2.4);
+                                           *writer_sync.0.lock().unwrap() = 2;
+                                           writer_sync.1.notify_all();
+                                       });
 
             // Wait a bit to make sure that the writer cannot proceed
-            let wait_result = sync.1.wait_timeout(
-                sync.0.lock().unwrap(),
-                Duration::from_millis(100)
-            );
+            let shared_lock = sync.0.lock().unwrap();
+            let wait_result =
+                sync.1.wait_timeout(shared_lock, Duration::from_millis(100));
             let (shared_lock, timeout_result) = wait_result.unwrap();
             assert!(timeout_result.timed_out());
             assert_eq!(*shared_lock, 1);
@@ -561,10 +559,8 @@ mod tests {
             let _ = buf_output.read();
 
             // Check that the writer can now proceed
-            let wait_result = sync.1.wait_timeout(
-                shared_lock,
-                Duration::from_millis(100)
-            );
+            let wait_result =
+                sync.1.wait_timeout(shared_lock, Duration::from_millis(100));
             let (shared_lock, timeout_result) = wait_result.unwrap();
             assert!(!timeout_result.timed_out());
             assert_eq!(*shared_lock, 2);
@@ -590,7 +586,7 @@ mod tests {
 
         // Check that we have an appropriate amount of buffers
         let num_buffers = buf_shared.buffers.len();
-        assert_eq!(num_buffers, 2*wf_conc_readers + 2);
+        assert_eq!(num_buffers, 2 * (1 + wf_conc_readers));
 
         // Decode and check the latest buffer metadata: we should have one
         // reader, no refcount overflow, and a valid latest buffer index
@@ -599,8 +595,8 @@ mod tests {
         assert_eq!(reader_count, 1);
         let overflow = latest_info.bitand(::SHARED_OVERFLOW_BIT) != 0;
         assert!(!overflow);
-        let latest_idx = latest_info.bitand(::SHARED_INDEX_MASK)
-                                    / ::SHARED_INDEX_MULTIPLIER;
+        let latest_idx = latest_info.bitand(::SHARED_INDEX_MASK) /
+                         ::SHARED_INDEX_MULTIPLIER;
         assert!(latest_idx < num_buffers);
 
         // The reader must initially use the latest buffer as a read buffer
@@ -619,7 +615,11 @@ mod tests {
         // Every buffer except for the read buffer should be considered free
         // in the writer's internal reference counting records. The read buffer
         // should use a special infinite refcount to completely forbid writing.
-        for tuple in buf.input.reader_counts.iter().enumerate() {
+        let indexes_and_refcounts = buf.input
+            .reader_counts
+            .iter()
+            .enumerate();
+        for tuple in indexes_and_refcounts {
             let (index, refcount) = tuple;
             if index != latest_idx {
                 assert_eq!(*refcount, 0);
