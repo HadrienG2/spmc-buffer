@@ -9,14 +9,15 @@ use std::sync::Arc;
 /// Triple buffering is an extremely efficient synchronization protocol when
 /// a producer thread wants to constantly update a value that is visible by a
 /// single consumer thread. However, it is not safe to use in the presence of
-/// multiple consumers, because the consumer thread can no longer assume that
-/// it is the only thread having access to the read buffer.
+/// multiple consumers, because a consumer thread can no longer assume that it
+/// is the only thread having access to the read buffer and discard said read
+/// buffer at will.
 ///
 /// Reference counting techniques can be used to build a variant of triple
 /// buffering which works for multiple consumers, remains provably wait-free
-/// wait-free if one extra buffer plus one per supplementary consumer is added,
-/// and degrades gracefully when a smaller amount of buffers is used. I call the
-/// resulting synchronization primitive an SPMC buffer.
+/// if one uses two buffers per consumer, and degrades gracefully when a smaller
+/// amount of buffers is used as long as consumers frequently fetch updates from
+/// the producer. I call the resulting synchronization primitive an SPMC buffer.
 ///
 pub struct SPMCBuffer<T: Clone> {
     /// Input object used by the producer to send updates
@@ -28,12 +29,15 @@ pub struct SPMCBuffer<T: Clone> {
 //
 impl<T: Clone> SPMCBuffer<T> {
     /// Construct an SPMC buffer allowing for wait-free writes under up to N
-    /// concurrent readouts to distinct buffers, and with some initial content.
+    /// concurrent readouts to distinct versions, and with some initial content.
     pub fn new(max_conc_readers: usize, initial: T) -> Self {
         // Translate max_conc_readers into an actual buffer count
-        let num_buffers = max_conc_readers + 3;
+        let num_buffers = 2 + 2*max_conc_readers;
 
-        // Start with the shared state. Initially, buffer 0 is the "latest" one.
+        // Check that this count is compatible with the current implementation
+        assert!((num_buffers-1)*SHARED_INDEX_MULTIPLIER <= SHARED_INDEX_MASK);
+
+        // Create the shared state. Buffer 0 is initially considered the latest.
         let shared_state = Arc::new(
             SPMCBufferSharedState {
                 buffers: vec![
@@ -53,7 +57,7 @@ impl<T: Clone> SPMCBuffer<T> {
         let mut result = SPMCBuffer {
             input: SPMCBufferInput {
                 shared: shared_state.clone(),
-                reference_counts: vec![0; num_buffers],
+                reader_counts: vec![0; num_buffers],
             },
             output: SPMCBufferOutput {
                 shared: shared_state,
@@ -61,8 +65,8 @@ impl<T: Clone> SPMCBuffer<T> {
             },
         };
 
-        // Mark the latest buffer with an "infinite" reference count, in order
-        // to remind ourselves to never write into it (it's reader-visible!)
+        // Mark the latest buffer with an "infinite" reference count, to forbid
+        // using it as a write buffer (it's reader-visible!)
         result.input.reference_counts[0] = INFINITE_REFCOUNT;
 
         // Return the resulting valid SPMC buffer
@@ -88,8 +92,8 @@ pub struct SPMCBufferInput<T: Clone> {
 
     /// Amount of readers who potentially have access to each (unreachable)
     /// buffer. The latest buffer, which is still reachable, is marked with an
-    /// "infinite" reference count, to warn that we don't know the true count.
-    reference_counts: Vec<RefCount>,
+    /// "infinite" reference count, to warn that we don't know the true value.
+    reader_counts: Vec<RefCount>,
 }
 //
 impl<T: Clone> SPMCBufferInput<T> {
@@ -98,19 +102,21 @@ impl<T: Clone> SPMCBufferInput<T> {
         // Access the shared state
         let ref shared_state = *self.shared;
 
-        // Go into a spin-loop, looking for an "old" buffer with no live reader
+        // Go into a spin-loop, waiting for an "old" buffer with no live reader.
+        // This loop must finish in a finite amount of iterations if each thread
+        // is allocated two private buffers, because readers can hold at most
+        // two buffers simultaneously. With less buffers, we may need to wait.
         let mut write_pos: Option<usize> = None;
         while write_pos == None {
             // We want to iterate over both buffers and associated refcounts
             let mut buf_rc_iter =
                 shared_state.buffers.iter()
-                                    .zip(self.reference_counts.iter());
+                                    .zip(self.reader_counts.iter());
 
             // We want to find a buffer which is unreachable, and whose previous
-            // readers have all moved on to more recent data. Unreachability is
-            // guaranteed by the fact that we artificially set the refcount of
-            // the public buffer to infinity, but we still need to check what
-            // the former readers of the unreachable buffers are doing.
+            // readers have all moved on to more recent data. We identify
+            // unreachable buffers by having previously tagged the latest buffer
+            // with an infinite reference count.
             write_pos = buf_rc_iter.position(|tuple| {
                 let (buffer, refcount) = tuple;
                 let done_readers = buffer.done_readers.load(Ordering::Relaxed);
@@ -119,15 +125,15 @@ impl<T: Clone> SPMCBufferInput<T> {
         }
         let write_idx = write_pos.unwrap();
 
-        // The buffer that we just obtained is provably unused by old readers
-        // and unreachable by new readers, so we can safely allocate it as a
-        // write buffer and put our data into it
+        // The buffer that we just obtained is unused by old readers and
+        // unreachable by new readers, so we can safely allocate it as a write
+        // buffer and put our new data into it
         let ref write_buffer = shared_state.buffers[write_idx];
         let write_ptr = write_buffer.data.get();
         unsafe { *write_ptr = value; }
 
-        // To avoid overflow, we should reset the buffer's reference count
-        // on publication: there's no need to account for previous readers.
+        // No one has read this version of the buffer yet, so we reset all
+        // reference-counting information to zero.
         write_buffer.done_readers.store(0, Ordering::Relaxed);
 
         // Publish our write buffer as the new latest buffer, and retrieve
@@ -186,13 +192,12 @@ impl<T: Clone> SPMCBufferOutput<T> {
             // refcount to tell the producer that we have access to it
             let latest_buf = shared_state.latest_buf.fetch_add(
                 1,
-                Ordering::Acquire  // Get the associated buffer state
+                Ordering::Acquire  // Fetch the associated buffer state
             );
 
-            // Drop our current read buffer. Because we already needed an
-            // acquire fence above, and the buffer discarding operation contains
-            // a read, we can safely use relaxed atomic order here: neither the
-            // CPU nor the compiler can reorder this operation before the fence.
+            // Drop our current read buffer. Because we already used an acquire
+            // fence above, we can safely use relaxed atomic order here: no CPU
+            // or compiler will reorder this operation before the fence.
             unsafe { self.discard_read_buffer(Ordering::Relaxed); }
 
             // In debug mode, make sure that overflow did not occur
@@ -210,8 +215,8 @@ impl<T: Clone> SPMCBufferOutput<T> {
 
     /// Drop the current read buffer. This is unsafe because it allows the
     /// writer to write into it, which means that the read buffer must never be
-    /// accessed after this operation completes. Be extremely careful with
-    /// memory ordering: this must NEVER be reordered before a buffer read!
+    /// accessed again after this operation completes. Be extremely careful with
+    /// memory ordering: this operation must NEVER be reordered before a read!
     unsafe fn discard_read_buffer(&self, order: Ordering) {
         self.shared.buffers[self.read_idx].done_readers.fetch_add(1, order);
     }
@@ -312,7 +317,7 @@ impl<T: Clone> Clone for Buffer<T> {
 ///   reader may increment the wrong refcount. Furthermore, the buffer that is
 ///   now targeted by the reader may have already be tagged as safe for reuse or
 ///   deletion by the writer, so if the reader proceeds with reading it, it may
-///   accidentally end up in a data race w/ the writer. This follows the
+///   accidentally end up in a data race with the writer. This follows the
 ///   classical rule of thumb that one should always reserve resources before
 ///   accessing them, however lightly.
 ///
