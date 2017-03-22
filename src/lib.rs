@@ -61,7 +61,7 @@ impl<T: Clone> SPMCBuffer<T> {
             },
         };
 
-        // Mark the public buffer with an "infinite" reference count, in order
+        // Mark the latest buffer with an "infinite" reference count, in order
         // to remind ourselves to never write into it (it's reader-visible!)
         result.input.reference_counts[0] = INFINITE_REFCOUNT;
 
@@ -88,7 +88,7 @@ pub struct SPMCBufferInput<T: Clone> {
 
     /// Amount of readers who potentially have access to each (unreachable)
     /// buffer. The latest buffer, which is still reachable, is marked with an
-    /// "infinite" reference count to warn that we don't know the true one.
+    /// "infinite" reference count, to warn that we don't know the true count.
     reference_counts: Vec<RefCount>,
 }
 //
