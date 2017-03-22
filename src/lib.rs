@@ -432,9 +432,26 @@ mod tests {
         assert!(!overflow);
         assert!(latest_idx < num_buffers);
 
-        // TODO: Check buffer contents
-        // TODO: Check reader and writer structs
-        unimplemented!();
+        // Reader must initially point towards the latest index
+        assert_eq!(buf.output.read_idx, latest_idx);
+
+        // Read buffer must be properly initialized
+        let ref read_buffer = buf_shared.buffers[latest_idx];
+        let read_ptr = read_buffer.data.get();
+        let done_readers = read_buffer.done_readers.load(Ordering::Relaxed);
+        assert_eq!(unsafe { *read_ptr }, 42);
+        assert_eq!(done_readers, 0);
+
+        // Writer must not be able to write in the read buffer, and must be able
+        // to write in every other buffer.
+        for tuple in buf.input.reader_counts.iter().enumerate() {
+            let (index, refcount) = tuple;
+            if index != latest_idx {
+                assert_eq!(*refcount, 0);
+            } else {
+                assert_eq!(*refcount, ::INFINITE_REFCOUNT);
+            }
+        }
     }
 }
 
