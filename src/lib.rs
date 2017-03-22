@@ -227,7 +227,7 @@ impl<T: Clone + PartialEq + Send> SPMCBufferOutput<T> {
             latest_info.bitand(SHARED_INDEX_MASK)
                 != self.read_idx * SHARED_INDEX_MULTIPLIER;
 
-        // If so, exchange our current read buffer with the latest buffer
+        // If so, drop our current read buffer and go with the latest buffer
         if update_available {
             // Acquire access to the latest buffer, incrementing its
             // refcount to tell the producer that we have access to it
@@ -352,7 +352,7 @@ impl<T: Clone + PartialEq + Send> SPMCBufferSharedState<T> {
                                 && (dr1 == dr2)
                         });
 
-        // Use that to deduce if the entire shared state is equal
+        // Use that to deduce if the entire shared state is equivalent
         buffers_equal
             && (self.latest_info.load(Ordering::Relaxed)
                 == other.latest_info.load(Ordering::Relaxed))
@@ -574,7 +574,7 @@ mod tests {
         }
     }
 
-    // TODO: Check that reading from an SPMC buffer works
+    // TODO: Check that reading from an SPMC buffer works (write-read-read)
     // TODO: Check other write/read scenarios (think about possible code paths)
     // TODO: Check that spawning a new reader and using it works
     // TODO: Check that the writer waits for readers if needed
