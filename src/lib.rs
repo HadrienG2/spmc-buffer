@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// amount of buffers is used as long as consumers frequently fetch updates from
 /// the producer. I call the resulting synchronization primitive an SPMC buffer.
 ///
-pub struct SPMCBuffer<T: Clone> {
+pub struct SPMCBuffer<T: Clone + Send> {
     /// Input object used by the producer to send updates
     input: SPMCBufferInput<T>,
 
@@ -27,7 +27,7 @@ pub struct SPMCBuffer<T: Clone> {
     output: SPMCBufferOutput<T>,
 }
 //
-impl<T: Clone> SPMCBuffer<T> {
+impl<T: Clone + Send> SPMCBuffer<T> {
     /// Construct an SPMC buffer allowing for wait-free writes under up to N
     /// concurrent readouts to distinct buffer versions
     pub fn new(wf_read_concurrency: usize, initial: T) -> Self {
@@ -85,7 +85,7 @@ impl<T: Clone> SPMCBuffer<T> {
 /// whenever he likes. These updates may or may not be nonblocking depending
 /// on the buffer size and the readout pattern.
 ///
-pub struct SPMCBufferInput<T: Clone> {
+pub struct SPMCBufferInput<T: Clone + Send> {
     /// Reference-counted shared state
     shared: Arc<SPMCBufferSharedState<T>>,
 
@@ -95,7 +95,7 @@ pub struct SPMCBufferInput<T: Clone> {
     reader_counts: Vec<RefCount>,
 }
 //
-impl<T: Clone> SPMCBufferInput<T> {
+impl<T: Clone + Send> SPMCBufferInput<T> {
     /// Write a new value into the SPMC buffer
     pub fn write(&mut self, value: T) {
         // Access the shared state
@@ -165,7 +165,7 @@ impl<T: Clone> SPMCBufferInput<T> {
 /// between the producer and a consumer will result cache contention induced
 /// slowdown, but deadlocks and scheduling-induced slowdowns cannot happen.
 ///
-pub struct SPMCBufferOutput<T: Clone> {
+pub struct SPMCBufferOutput<T: Clone + Send> {
     /// Reference-counted shared state
     shared: Arc<SPMCBufferSharedState<T>>,
 
@@ -173,7 +173,7 @@ pub struct SPMCBufferOutput<T: Clone> {
     read_idx: BufferIndex,
 }
 //
-impl<T: Clone> SPMCBufferOutput<T> {
+impl<T: Clone + Send> SPMCBufferOutput<T> {
     /// Access the latest value from the SPMC buffer
     pub fn read(&mut self) -> &T {
         // Access the shared state
@@ -221,7 +221,7 @@ impl<T: Clone> SPMCBufferOutput<T> {
     }
 }
 //
-impl<T: Clone> Clone for SPMCBufferOutput<T> {
+impl<T: Clone + Send> Clone for SPMCBufferOutput<T> {
     // Create a new output interface associated with a given SPMC buffer
     fn clone(&self) -> Self {
         // Clone the current shared state
@@ -245,7 +245,7 @@ impl<T: Clone> Clone for SPMCBufferOutput<T> {
     }
 }
 //
-impl<T: Clone> Drop for SPMCBufferOutput<T> {
+impl<T: Clone + Send> Drop for SPMCBufferOutput<T> {
     // Discard our read buffer on thread exit
     fn drop(&mut self) {
         // We must use release ordering here in order to prevent preceding
@@ -274,7 +274,7 @@ impl<T: Clone> Drop for SPMCBufferOutput<T> {
 /// available anymore, and thus that the writer can observe a state where a
 /// reader has access to a new buffer, but not yet discarded the previous one.
 ///
-struct SPMCBufferSharedState<T: Clone> {
+struct SPMCBufferSharedState<T: Clone + Send> {
     /// Data storage buffers
     buffers: Vec<Buffer<T>>,
 
@@ -282,7 +282,7 @@ struct SPMCBufferSharedState<T: Clone> {
     latest_info: AtomicSharedIndex,
 }
 //
-struct Buffer<T: Clone> {
+struct Buffer<T: Clone + Send> {
     /// Actual data must be in an UnsafeCell so that Rust knows it's mutable
     data: UnsafeCell<T>,
 
@@ -290,7 +290,7 @@ struct Buffer<T: Clone> {
     done_readers: AtomicRefCount,
 }
 //
-impl<T: Clone> Clone for Buffer<T> {
+impl<T: Clone + Send> Clone for Buffer<T> {
     /// WARNING: Buffers are NOT safe to clone, because a writer might be
     ///          concurrently writing to them. The only reason why I'm not
     ///          marking this function as unsafe is that Rust won't allow me to
