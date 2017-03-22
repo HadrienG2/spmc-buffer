@@ -29,15 +29,16 @@ pub struct SPMCBuffer<T: Clone> {
 //
 impl<T: Clone> SPMCBuffer<T> {
     /// Construct an SPMC buffer allowing for wait-free writes under up to N
-    /// concurrent readouts to distinct versions, and with some initial content.
-    pub fn new(max_conc_readers: usize, initial: T) -> Self {
-        // Translate max_conc_readers into an actual buffer count
-        let num_buffers = 2 + 2*max_conc_readers;
+    /// concurrent readouts to distinct versions
+    pub fn new(wf_read_concurrency: usize, initial: T) -> Self {
+        // Check that the amount of readers fits implementation limits
+        assert!(wf_read_concurrency <= MAX_CONCURRENT_READERS);
 
-        // Check that this count is compatible with the current implementation
-        assert!((num_buffers-1)*SHARED_INDEX_MULTIPLIER <= SHARED_INDEX_MASK);
+        // Translate wait-free read concurrency into an actual buffer count
+        let num_buffers = 2 + 2*wf_read_concurrency;
 
-        // Create the shared state. Buffer 0 is initially considered the latest.
+        // Create the shared state. Buffer 0 is initially considered the latest,
+        // with one reader accessing it (corresponding to a refcount of 1).
         let shared_state = Arc::new(
             SPMCBufferSharedState {
                 buffers: vec![
@@ -47,13 +48,11 @@ impl<T: Clone> SPMCBuffer<T> {
                     };
                     num_buffers
                 ],
-                latest_buf: AtomicSharedIndex::new(0),
+                latest_buf: AtomicSharedIndex::new(1),
             }
         );
 
-        // ...then construct the input and output structs. Any consumer should
-        // be initialized with an invalid read index so that it increments the
-        // refcount of the latest buffer on its first read.
+        // ...then construct the input and output structs
         let mut result = SPMCBuffer {
             input: SPMCBufferInput {
                 shared: shared_state.clone(),
@@ -61,13 +60,13 @@ impl<T: Clone> SPMCBuffer<T> {
             },
             output: SPMCBufferOutput {
                 shared: shared_state,
-                read_idx: INVALID_INDEX,
+                read_idx: 0,
             },
         };
 
         // Mark the latest buffer with an "infinite" reference count, to forbid
-        // using it as a write buffer (it's reader-visible!)
-        result.input.reference_counts[0] = INFINITE_REFCOUNT;
+        // selecting it as a write buffer (it's reader-visible!)
+        result.input.reader_counts[0] = INFINITE_REFCOUNT;
 
         // Return the resulting valid SPMC buffer
         result
@@ -103,7 +102,7 @@ impl<T: Clone> SPMCBufferInput<T> {
         let ref shared_state = *self.shared;
 
         // Go into a spin-loop, waiting for an "old" buffer with no live reader.
-        // This loop must finish in a finite amount of iterations if each thread
+        // This loop will finish in a finite amount of iterations if each thread
         // is allocated two private buffers, because readers can hold at most
         // two buffers simultaneously. With less buffers, we may need to wait.
         let mut write_pos: Option<usize> = None;
@@ -125,7 +124,7 @@ impl<T: Clone> SPMCBufferInput<T> {
         }
         let write_idx = write_pos.unwrap();
 
-        // The buffer that we just obtained is unused by old readers and
+        // The buffer that we just obtained has been freed by old readers and is
         // unreachable by new readers, so we can safely allocate it as a write
         // buffer and put our new data into it
         let ref write_buffer = shared_state.buffers[write_idx];
@@ -153,8 +152,8 @@ impl<T: Clone> SPMCBufferInput<T> {
 
         // Write down the former buffer's refcount, and set the latest buffer's
         // refcount to infinity so that we don't accidentally write to it
-        self.reference_counts[former_idx] = former_readcount;
-        self.reference_counts[write_idx] = INFINITE_REFCOUNT;
+        self.reader_counts[former_idx] = former_readcount;
+        self.reader_counts[write_idx] = INFINITE_REFCOUNT;
     }                      
 }
 
@@ -223,11 +222,25 @@ impl<T: Clone> SPMCBufferOutput<T> {
 }
 //
 impl<T: Clone> Clone for SPMCBufferOutput<T> {
-    // Create a new reader associated with a given SPMC buffer
+    // Create a new output interface associated with a given SPMC buffer
     fn clone(&self) -> Self {
+        // Clone the current shared state
+        let shared_state = self.shared.clone();
+
+        // Acquire access to the latest buffer, incrementing its refcount
+        let latest_buf = shared_state.latest_buf.fetch_add(
+            1,
+            Ordering::Acquire  // Fetch the associated buffer state
+        );
+
+        // Extract the index of this new read buffer
+        let new_read_idx = latest_buf.bitand(SHARED_INDEX_MASK)
+                                     / SHARED_INDEX_MULTIPLIER;
+
+        // Build a new output interface from this information
         SPMCBufferOutput {
-            shared: self.shared.clone(),
-            read_idx: INVALID_INDEX,
+            shared: shared_state,
+            read_idx: new_read_idx,
         }
     }
 }
@@ -346,7 +359,6 @@ impl<T: Clone> Clone for Buffer<T> {
 /// TODO: Switch to U16 / AtomicU16 once the later is stable
 ///
 type BufferIndex = usize;
-const INVALID_INDEX: BufferIndex = 0xffff;
 //
 type RefCount = usize;
 const INFINITE_REFCOUNT: RefCount = 0xffff;
@@ -358,12 +370,49 @@ const SHARED_READCOUNT_MASK:   SharedIndex = 0b0000_0001_1111_1111;
 const SHARED_OVERFLOW_BIT:     SharedIndex = 0b0000_0010_0000_0000;
 const SHARED_INDEX_MASK:       SharedIndex = 0b1111_1100_0000_0000;
 const SHARED_INDEX_MULTIPLIER: SharedIndex = 0b0000_0100_0000_0000;
+//
+const MAX_BUFFERS: usize = SHARED_INDEX_MASK/SHARED_INDEX_MULTIPLIER + 1;
+const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS/2 - 1;
 
 
-// TODO: Add tests
+/// Unit tests
 #[cfg(test)]
 mod tests {
+    /// Check that SPMC buffers are properly initialized as long as the
+    /// requested amount of concurrent readers stays in implementation limits.
     #[test]
-    fn it_works() {
+    fn initial_state() {
+        // Test for 0 readers (double-buffering limit)
+        test_initialization(0);
+
+        // Test for 1 concurrent reader (quadruple buffering)
+        test_initialization(1);
+
+        // Test for maximal amount of readers
+        test_initialization(::MAX_CONCURRENT_READERS);
+    }
+
+    /// Check that SPMC buffer initialization panics if too many readers are
+    /// requested with respect to implementation limits.
+    #[test]
+    #[should_panic]
+    fn too_many_readers() {
+        test_initialization(::MAX_CONCURRENT_READERS+1);
+    }
+
+    // TODO: Check that (sequentially) writing to an SPMC buffer works
+    // TODO: Check that (sequentially) reading from an SPMC buffer works, for
+    //       any amount of concurrent readers
+    // TODO: Check that the writer waits for readers if needed
+    // TODO: Check that concurrent reads and writes work
+
+    /// Try initializing a buffer for some maximal wait-free readout concurrency
+    fn test_initialization(wf_concurrent_readers: usize) {
+        // Create a buffer with the requested wait-free read concurrency
+        let _ = ::SPMCBuffer::new(wf_concurrent_readers, 42);
+        // TODO: Check that the buffer was properly initialized
     }
 }
+
+
+// TODO: Add performance benchmarks
