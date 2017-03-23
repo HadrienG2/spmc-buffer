@@ -570,7 +570,65 @@ mod tests {
         }
     }
 
-    // TODO: Check that reading from an SPMC buffer works (write-read-read)
+    /// Check that reading from an SPMC buffer works
+    #[test]
+    fn write_read_read_sequence() {
+        // Let's create an SPMC buffer and write into it
+        let mut buf = ::SPMCBuffer::new(0, false);
+        buf.input.write(true);
+
+        // Test readout from a dirty (freshly written) buffer
+        {
+            // Back up the initial buffer state
+            let old_buf = buf.clone();
+            let ref old_shared = old_buf.input.shared;
+
+            // Read from the buffer
+            let result = *buf.output.read();
+
+            // Output value should be correct
+            assert_eq!(result, true);
+
+            // Starting from the old buffer state...
+            let mut expected_buf = old_buf.clone();
+            let ref expected_shared = expected_buf.input.shared;
+
+            // We expect the reader to have discarded its former read buffer
+            let old_read_idx = old_buf.output.read_idx;
+            expected_shared.buffers[old_read_idx]
+                .done_readers
+                .store(1, Ordering::Relaxed);
+
+            // We expect the reader to be now accessing the new latest buffer
+            let latest_idx = old_shared.latest_info
+                .load(Ordering::Relaxed)
+                .bitand(::SHARED_INDEX_MASK) /
+                    ::SHARED_INDEX_MULTIPLIER;
+            expected_buf.output.read_idx = latest_idx;
+
+            // We expect the latest buffer's reference count to have increased
+            expected_shared.latest_info.fetch_add(1, Ordering::Relaxed);
+
+            // Nothing else should have changed
+            assert_eq!(buf, expected_buf);
+        }
+
+        // Test readout from a clean (unchanged) buffer
+        {
+            // Back up the initial buffer state
+            let old_buf = buf.clone();
+
+            // Read from the buffer
+            let result = *buf.output.read();
+
+            // Output value should be correct
+            assert_eq!(result, true);
+
+            // Buffer state should be unchanged
+            assert_eq!(buf, old_buf);
+        }
+    }
+
     // TODO: Check other write/read scenarios (think about possible code paths)
     // TODO: Check that spawning a new reader and using it works
     // TODO: Check that the writer waits for readers if needed
