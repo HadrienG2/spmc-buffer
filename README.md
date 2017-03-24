@@ -83,10 +83,31 @@ one must first check some assumptions:
 Taking this and the relatively long run time (~10 s) into account, these tests
 are ignored by default.
 
-To run the concurrent tests, make sure no one is eating CPU in the background,
-then run the following command:
+Finally, we have benchmarks, which allow you to test how well the code is
+performing on your machine. Because cargo bench has not yet landed in Stable
+Rust, these benchmarks masquerade as tests, which make them a bit unpleasant to
+run. I apologize for the inconvenience.
+
+To run the concurrent tests and the benchmarks, make sure no one is eating CPU
+in the background and do:
 
     $ cargo test --release -- --ignored --test-threads=1
+
+Here is a guide to interpreting the benchmark results:
+
+* `clean_read` measures the triple buffer readout time when the data has not
+  changed. It should be extremely fast (a couple of CPU clock cycles).
+* `write` measures the amount of time it takes to write data in the triple
+  buffer when no one is reading.
+* `write_and_dirty_read` performs a write as before, immediately followed by a
+  sequential read. To get the dirty read performance, substract the write time
+  from that result. Writes and dirty read should take comparable time.
+
+On my laptop's CPU (Intel Core i7-4720HQ), typical results are as follows:
+
+* Write: 12 ns
+* Clean read: 1.3 ns
+* Dirty read: 17 ns
 
 
 ## License

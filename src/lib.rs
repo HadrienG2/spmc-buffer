@@ -988,4 +988,85 @@ mod tests {
 }
 
 
-// TODO: Add performance benchmarks
+/// Performance benchmarks
+///
+/// These benchmarks masquerading as tests are a stopgap solution until
+/// benchmarking lands in Stable Rust. They should be compiled in release mode,
+/// and run with only one OS thread. In addition, the default behaviour of
+/// swallowing test output should obviously be suppressed.
+///
+/// TL;DR: cargo test --release -- --ignored --nocapture --test-threads=1
+///
+/// TODO: Switch to standard Rust benchmarks once they are stable
+///
+#[cfg(test)]
+mod benchmarks {
+    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Instant;
+
+    /// Benchmark for clean read performance
+    #[test]
+    #[ignore]
+    #[allow(unused_variables)]
+    fn clean_read() {
+        // Create a buffer
+        let mut buf = ::SPMCBuffer::new(1, 0u32);
+
+        // Benchmark clean reads
+        benchmark(3_000_000_000u32, |iter| {
+            let read = *buf.output.read();
+            assert!(read < u32::max_value());
+        });
+    }
+
+    /// Benchmark for write performance
+    #[test]
+    #[ignore]
+    fn write() {
+        // Create a buffer
+        let mut buf = ::SPMCBuffer::new(1, 0u32);
+
+        // Benchmark writes
+        benchmark(300_000_000u32, |iter| buf.input.write(iter));
+    }
+
+    /// Benchmark for write + dirty read performance
+    #[test]
+    #[ignore]
+    fn write_and_dirty_read() {
+        // Create a buffer
+        let mut buf = ::SPMCBuffer::new(1, 0u32);
+
+        // Benchmark writes + dirty reads
+        benchmark(140_000_000u32, |iter| {
+            buf.input.write(iter);
+            let read = *buf.output.read();
+            assert!(read < u32::max_value());
+        });
+    }
+
+    // TODO: Add concurrent benchmarks
+
+    /// Simple benchmark harness while I'm waiting for #[bench] to stabilize
+    fn benchmark<F: FnMut(u32)>(num_iterations: u32, mut iteration: F) {
+        // Run benchmark loop
+        let start_time = Instant::now();
+        for iter in 1..num_iterations {
+            iteration(iter)
+        }
+        let total_duration = start_time.elapsed();
+
+        // Put results in readable units
+        let total_ms = (total_duration.as_secs() as u32) * 1000 +
+                       total_duration.subsec_nanos() / 1000000;
+        let iter_ns = (total_duration / num_iterations).subsec_nanos();
+
+        // Display the results
+        print!("{} ms ({} iters, ~{} ns/iter): ",
+               total_ms,
+               num_iterations,
+               iter_ns + 1);
+    }
+}
