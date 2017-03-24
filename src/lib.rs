@@ -458,9 +458,9 @@ const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS / 2 - 1;
 #[cfg(test)]
 mod tests {
     use std::ops::BitAnd;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
     use std::sync::atomic::Ordering;
-    use std::thread;
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
     /// Check that SPMC buffers are properly initialized as long as the
@@ -711,7 +711,38 @@ mod tests {
         }
     }
 
-    // TODO: Check that concurrent reads and writes work
+    /// Check that uncontended concurrent reads and writes work
+    ///
+    /// **WARNING:** This test unfortunately needs to have timing-dependent
+    /// behaviour to do its job. If it fails for you, try the following:
+    ///
+    /// - Close running applications in the background
+    /// - Re-run the tests with only one OS thread (--test-threads=1)
+    /// - Increase the writer sleep period
+    ///
+    #[test]
+    #[ignore]
+    fn uncontended_concurrent_access() {
+        // Try it in the double-buffering regime
+        test_rate_limited_writes(false);
+
+        // Try it in the wait-free regime
+        test_rate_limited_writes(true);
+    }
+
+    /// Check that contended reads and writes work
+    ///
+    /// **WARNING:** Caveats of uncontended concurrent tests also apply here.
+    ///
+    #[test]
+    #[ignore]
+    fn contended_concurrent_access() {
+        // Try it in the double-buffering regime
+        test_max_rate_writes(false);
+
+        // Try it in the wait-free regime
+        test_max_rate_writes(true);
+    }
 
     /// Try initializing a buffer for some maximal wait-free readout concurrency
     fn test_initialization(wf_conc_readers: usize) {
@@ -763,6 +794,159 @@ mod tests {
             } else {
                 assert_eq!(*refcount, ::INFINITE_REFCOUNT);
             }
+        }
+    }
+
+    // Test concurrent access with a rate-limited writer, either in the double
+    // buffering or in the wait_free regime
+    fn test_rate_limited_writes(wait_free_regime: bool) {
+        // We will stress the infrastructure by performing this many writes
+        // as two readers continuously read the latest value
+        const TEST_WRITE_COUNT: u64 = 5000;
+
+        // Create a concurrent test fixture
+        let fixture = ConcurrentTestFixture::new(wait_free_regime);
+
+        // Run the concurrent test
+        fixture.run_test(
+            |mut buf_input: ::SPMCBufferInput<u64>| {
+                // The writer continuously increments the buffered value, with
+                // some rate limiting to ensure the reader can see the updates
+                for value in 1..(TEST_WRITE_COUNT + 1) {
+                    buf_input.write(value);
+                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
+                }
+            },
+            |mut buf_output: ::SPMCBufferOutput<u64>| {
+                // The readers continuously check the buffered value, and should
+                // see every update without any incoherent value in the middle
+                let mut last_value = 0u64;
+                while last_value != TEST_WRITE_COUNT {
+                    let new_value = *buf_output.read();
+                    assert!((new_value >= last_value) &&
+                            (new_value - last_value <= 1));
+                    last_value = new_value;
+                }
+            }
+        );
+    }
+
+    // Test concurrent access with a writer writing at the maximal rate, either
+    // in the double buffering or in the wait_free regime
+    fn test_max_rate_writes(wait_free_regime: bool) {
+        // We will stress the infrastructure by performing this many writes
+        // as two readers continuously read the latest value
+        const TEST_WRITE_COUNT: u64 = 20_000_000;
+
+        // Create a concurrent test fixture
+        let fixture = ConcurrentTestFixture::new(wait_free_regime);
+
+        // Run the concurrent test
+        fixture.run_test(
+            |mut buf_input: ::SPMCBufferInput<u64>| {
+                // The writer increments the buffered value as fast as possible
+                for value in 1..(TEST_WRITE_COUNT + 1) {
+                    buf_input.write(value);
+                }
+            },
+            |mut buf_output: ::SPMCBufferOutput<u64>| {
+                // The readers continuously check the buffered value, and should
+                // not spot any garbage value slipping in the middle
+                let mut last_value = 0u64;
+                while last_value != TEST_WRITE_COUNT {
+                    let new_value = *buf_output.read();
+                    assert!((new_value >= last_value) &&
+                            (new_value <= TEST_WRITE_COUNT));
+                    last_value = new_value;
+                }
+            }
+        );
+    }
+
+    // This test fixture is shared by all concurrent access tests, rate-limited
+    // and rate-unlimited alike
+    struct ConcurrentTestFixture {
+        /// Required test setup for the writer
+        w_fixture: Option<(::SPMCBufferInput<u64>, Arc<Barrier>)>,
+
+        /// Required test setup for the readers
+        r1_fixture: Option<(::SPMCBufferOutput<u64>, Arc<Barrier>)>,
+        r2_fixture: Option<(::SPMCBufferOutput<u64>, Arc<Barrier>)>,
+    }
+    //
+    impl ConcurrentTestFixture {
+        // Initialize the concurrent text fixture
+        pub fn new(wait_free_regime: bool) -> Self {
+            // Create an SPMC buffer with appropriate dimensions
+            let wf_conc_readers = if wait_free_regime { 2 } else { 0 };
+            let buf = ::SPMCBuffer::new(wf_conc_readers, 0u64);
+
+            // Extract the input stage so that we can send it to the writer
+            let (buf_input, buf_output) = buf.split();
+
+            // Setup a barrier to synchronize reader and writer startup
+            let barrier = Arc::new(Barrier::new(3));
+
+            // Return a complete test fixture
+            ConcurrentTestFixture {
+                w_fixture: Some((buf_input, barrier.clone())),
+                r1_fixture: Some((buf_output.clone(), barrier.clone())),
+                r2_fixture: Some((buf_output, barrier)),
+            }
+        }
+
+        // Consume the test fixture, running a test with the proposed reader
+        // and writer algorithms.
+        pub fn run_test<W, R>(mut self, writer_func: W, reader_func: R)
+            where W: Fn(::SPMCBufferInput<u64>) + Send + 'static,
+                  R: Fn(::SPMCBufferOutput<u64>) + Send + Sync + 'static
+        {
+            // Schedule the writer thread
+            let writer = self.schedule_writer(writer_func);
+
+            // Setup movable closures for the reader threads
+            let r1_closure = Arc::new(reader_func);
+            let r2_closure = r1_closure.clone();
+
+            // Schedule one reader and run the other synchronously
+            let reader1 = self.schedule_reader1(r1_closure);
+            self.run_reader2(r2_closure);
+
+            // Wait for the writer and the asynchronous reader to finish
+            writer.join().unwrap();
+            reader1.join().unwrap();
+        }
+
+        // Schedule the writer thread
+        fn schedule_writer<F>(&mut self, writer: F) -> JoinHandle<()>
+            where F: Fn(::SPMCBufferInput<u64>) + Send + 'static
+        {
+            let (buf_input, barrier) = self.w_fixture.take().unwrap();
+            thread::spawn(move || {
+                barrier.wait();
+                writer(buf_input)
+            })
+        }
+
+        // Schedule the first reader thread
+        fn schedule_reader1<F>(&mut self, reader: Arc<F>) -> JoinHandle<()>
+            where F: Fn(::SPMCBufferOutput<u64>) + Send + Sync + 'static
+        {
+            let (buf_output, barrier) = self.r1_fixture.take().unwrap();
+            thread::spawn(move || {
+                barrier.wait();
+                reader(buf_output)
+            })
+        }
+
+        // Run the second reader synchronously
+        fn run_reader2<F>(&mut self, reader: Arc<F>)
+            where F: Fn(::SPMCBufferOutput<u64>)
+        {
+            let (buf_output, barrier) = self.r2_fixture.take().unwrap();
+            barrier.wait();
+            reader(buf_output);
         }
     }
 }
