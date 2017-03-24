@@ -924,9 +924,9 @@ mod tests {
         {
             let (buf_input, barrier) = self.w_fixture.take().unwrap();
             thread::spawn(move || {
-                barrier.wait();
-                writer(buf_input)
-            })
+                              barrier.wait();
+                              writer(buf_input)
+                          })
         }
 
         // Schedule the first reader thread
@@ -935,9 +935,9 @@ mod tests {
         {
             let (buf_output, barrier) = self.r1_fixture.take().unwrap();
             thread::spawn(move || {
-                barrier.wait();
-                reader(buf_output)
-            })
+                              barrier.wait();
+                              reader(buf_output)
+                          })
         }
 
         // Run the second reader synchronously
