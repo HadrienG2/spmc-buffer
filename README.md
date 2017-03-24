@@ -102,12 +102,19 @@ Here is a guide to interpreting the benchmark results:
 * `write_and_dirty_read` performs a write as before, immediately followed by a
   sequential read. To get the dirty read performance, substract the write time
   from that result. Writes and dirty read should take comparable time.
+* `concurrent_write` measures the write performance when a reader is
+  continuously reading. Expect significantly worse performance: lock-free
+  techniques can help against contention, but are not a panacea.
+* `concurrent_read` measures the read performance when a writer is continuously
+  writing. Again, a significant hit is to be expected.
 
 On my laptop's CPU (Intel Core i7-4720HQ), typical results are as follows:
 
 * Write: 12 ns
 * Clean read: 1.3 ns
 * Dirty read: 17 ns
+* Concurrent write: 100 ns
+* Concurrent read: 38 ns
 
 
 ## License
