@@ -1,3 +1,39 @@
+//! Multi-consumer generalization of triple buffering
+//!
+//! This crate is an extension to the triple buffering mechanism proposed as
+//! part of triple_buffer, which allows it to work with multiple consumers at
+//! the expense of some additional CPU and memory overhead.
+//!
+//! Like a triple buffer, the SPMC buffer presented here can be used when a
+//! single producer thread is frequently updating a shared data block, which is
+//! to be subsequently read by a set of consumer threads. Reading is always
+//! wait-free, writing can also be if sufficient storage is allocated.
+//!
+//! # Examples
+//!
+//! ```
+//! // Create an SPMC buffer of any Clone type
+//! use spmc_buffer::SPMCBuffer;
+//! let buf = SPMCBuffer::new(2, 1.0);
+//!
+//! // Split it into an input and output interface
+//! let (mut buf_input, mut buf_output) = buf.split();
+//!
+//! // Create as many extra output interfaces as needed
+//! let mut buf_output2 = buf_output.clone();
+//!
+//! // The producer can move a value into the buffer at any time
+//! buf_input.write(4.2);
+//!
+//! // A consumer can access the latest value from the producer at any time
+//! let mut latest_value_ref = buf_output.read();
+//! assert_eq!(*latest_value_ref, 4.2);
+//! let latest_value_ref2 = buf_output2.read();
+//! assert_eq!(*latest_value_ref2, 4.2);
+//! ```
+
+#![deny(missing_docs)]
+
 use std::cell::UnsafeCell;
 use std::ops::BitAnd;
 use std::sync::atomic::{AtomicUsize, Ordering};
