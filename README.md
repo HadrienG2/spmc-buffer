@@ -1,4 +1,4 @@
-# Multi-consumer extensions to triple buffering ("SPMC buffer")
+# SPMC Buffer: Triple-buffering for multiple consumers
 
 ## What is this?
 
@@ -37,12 +37,12 @@ assert_eq!(*latest_value_ref2, 4.2);
 
 ## Give me details! How does it compare to alternatives?
 
-Compared to a triple buffer:
+Compared to a triple buffer an SPMC buffer...
 
-- Supports multiple consumers
+- Supports multiple consumers (that's the point!)
 - Consumes more CPU time and memory in the single-consumer case
-- Not always wait-free for the writer. The guarantee can be offered, but it has
-  large costs in terms of memory consumption for many readers.
+- Is not always wait-free for the writer. The guarantee can be offered, but it
+  has quite large memory costs for many readers.
 
 In short, SPMC buffering is what you're after in scenarios where a shared
 memory location is updated frequently by a single writer, read by multiple
@@ -74,11 +74,11 @@ one must first check some assumptions:
 - The testing host must have at least 3 physical CPU cores to test all possible
   race conditions
 - No other code should be eating CPU in the background. Including other tests.
-- As the proper writing rate is system-dependent, what is configured in this
-  test may not be appropriate for your machine.
+- Some tests have timing-dependent behaviour, and may require manual tweaking
+  of sleep periods for your specific system.
 
-Taking this and the relatively long run time (~10 s) into account, this test is
-ignored by default.
+Taking this and the relatively long run time (~10 s) into account, these tests
+are ignored by default.
 
 To run the concurrent tests, make sure no one is eating CPU in the background,
 then run the following command:
