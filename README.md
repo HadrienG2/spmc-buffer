@@ -1,5 +1,8 @@
 # SPMC Buffer: Triple-buffering for multiple consumers
 
+[![On crates.io](https://img.shields.io/crates/v/spmc_buffer.svg)](https://crates.io/crates/spmc_buffer)
+[![On docs.rs](https://docs.rs/spmc_buffer/badge.svg)](https://docs.rs/spmc_buffer/)
+
 ## What is this?
 
 This is an extension of my earlier work on triple buffering, which supports
