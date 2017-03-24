@@ -629,9 +629,88 @@ mod tests {
         }
     }
 
-    // TODO: Check other write/read scenarios (think about possible code paths)
-    // TODO: Check that spawning a new reader and using it works
-    // TODO: Check that the writer waits for readers if needed
+    /// Check that writing after a dirty read works
+    #[test]
+    fn dirty_read_write_sequence() {
+        // Let's create an SPMC buffer, write into it, and perform a dirty read
+        let mut buf = ::SPMCBuffer::new(0, [1, 2, 3]);
+        buf.input.write([4, 5, 6]);
+        let _ = buf.output.read();
+
+        // Back up the current buffer state
+        let old_buf = buf.clone();
+
+        // Write to the buffer again
+        buf.input.write([7, 8, 9]);
+
+        // Analyze the new buffer state
+        {
+            // Starting from the old buffer state...
+            let mut expected_buf = old_buf.clone();
+            let ref expected_shared = expected_buf.input.shared;
+
+            // We expect the buffer which is NOT accessed by the current reader
+            // to have received the new value from the writer.
+            let old_read_idx = old_buf.output.read_idx;
+            let write_idx = 1 - old_read_idx;
+            let ref write_buffer = expected_shared.buffers[write_idx];
+            let write_ptr = write_buffer.data.get();
+            unsafe {
+                *write_ptr = [7, 8, 9];
+            }
+
+            // We expect the buffer's reference counts to have been cleared
+            write_buffer.done_readers.store(0, Ordering::Relaxed);
+
+            // We expect the latest buffer information to now point towards
+            // this write buffer
+            let new_latest_info = write_idx * ::SHARED_INDEX_MULTIPLIER;
+            expected_shared.latest_info.store(new_latest_info,
+                                              Ordering::Relaxed);
+
+            // We expect the writer to have marked this write index as
+            // unreachable, since it is now reader-visible, and to have fetched
+            // the reference count of the former read buffer
+            expected_buf.input.reader_counts[write_idx] = ::INFINITE_REFCOUNT;
+            expected_buf.input.reader_counts[old_read_idx] = 1;
+
+            // Nothing else should have changed
+            assert_eq!(buf, expected_buf);
+        }
+    }
+
+    // Check that spawning a new reader and using it works
+    #[test]
+    fn spawn_new_reader() {
+        // Let's create a double buffer
+        let buf = ::SPMCBuffer::new(0, (64, 4.6));
+
+        // Backup the initial buffer state
+        let old_buf = buf.clone();
+
+        // Clone the output
+        let new_output = buf.output.clone();
+
+        // Analyze the new buffer state
+        {
+            // Starting from the old buffer state...
+            let expected_buf = old_buf.clone();
+            let ref expected_shared = expected_buf.input.shared;
+
+            // We expect the latest buffer's reference count to have increased
+            let old_latest = expected_shared.latest_info
+                .fetch_add(1, Ordering::Relaxed);
+
+            // We expect the new reader to be pointing towards it
+            let latest_idx = old_latest.bitand(::SHARED_INDEX_MASK) /
+                             ::SHARED_INDEX_MULTIPLIER;
+            assert_eq!(new_output.read_idx, latest_idx);
+
+            // Nothing else should have changed
+            assert_eq!(buf, expected_buf);
+        }
+    }
+
     // TODO: Check that concurrent reads and writes work
 
     /// Try initializing a buffer for some maximal wait-free readout concurrency
