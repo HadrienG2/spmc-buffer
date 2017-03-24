@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A single-producer multiple-consumer buffer, useful for thread-safe data
-/// sharing. More general variant of triple buffering for multiple consumers.
+/// sharing in scenarios where triple buffering won't cut it.
 ///
 /// Triple buffering is an extremely efficient synchronization protocol when
 /// a producer thread wants to constantly update a value that is visible by a
