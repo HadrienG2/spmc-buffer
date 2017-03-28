@@ -65,14 +65,15 @@ pub struct SPMCBuffer<T: Clone + PartialEq + Send> {
 }
 //
 impl<T: Clone + PartialEq + Send> SPMCBuffer<T> {
-    /// Construct an SPMC buffer allowing for wait-free writes under up to N
-    /// concurrent readouts to distinct buffer versions
-    pub fn new(wf_read_concurrency: usize, initial: T) -> Self {
-        // Check that the amount of readers fits implementation limits
-        assert!(wf_read_concurrency <= MAX_CONCURRENT_READERS);
+    /// Initialize an SPMC buffer with a certain amount of read buffers (which
+    /// roughly determines how many readers can be accessing the structure at
+    /// a slow pace before the writer starts to block).
+    pub fn new(read_buffers: usize, initial: T) -> Self {
+        // Check that the amount of read buffers fits implementation limits
+        assert!(read_buffers <= MAX_READ_BUFFERS);
 
-        // Translate wait-free read concurrency into an actual buffer count
-        let num_buffers = 2 * (1 + wf_read_concurrency);
+        // Compute the actual buffer count
+        let num_buffers = 2 + read_buffers;
 
         // Create the shared state. Buffer 0 is initially considered the latest,
         // and has one reader accessing it (corresponding to a refcount of 1).
@@ -341,17 +342,16 @@ impl<T: Clone + PartialEq + Send> Drop for SPMCBufferOutput<T> {
 ///
 /// The number of buffers N is a design tradeoff: the larger it is, the more
 /// robust the primitive is against contention, at the cost of increased memory
-/// usage. An SPMC buffer is provably wait-free for both readers and writers if
-/// N = Nreaders + 3, where Nreaders is the amount of data consumers, but it
-/// can work correctly in a degraded regime which is wait-free for readers and
-/// potentially blocking for writers as long as N >= 2.
+/// usage. An SPMC buffer is wait free for readers, and almost wait-free for
+/// writers, if N = Nreaders + 2, where Nreaders is the amount of consumers. But
+/// it can work correctly in a degraded regime which is wait-free for readers
+/// and potentially blocking for writers as long as N >= 2.
 ///
-/// Note that for 1 reader, we need 4 buffers to be provably wait-free, rather
-/// than 3 in the case of triple buffering. The explanation for this boils down
-/// to the fact that we need to use two separate atomic variables to signal
-/// incoming and departing readers, which means that atomic buffer swap is not
-/// available anymore, and thus that the writer can observe a state where a
-/// reader has access to a new buffer, but not yet discarded the previous one.
+/// Note that I said "almost" wait-free. True writer wait-freedom can only be
+/// proven in any circumstances by adding extra memory barriers to the
+/// consumer's algorithm, which can have a high cost on relaxed-memory archs
+/// like ARM and POWER. I do not consider that to be worth it when one can often
+/// just use more buffers if writer contention starts to be problematic.
 ///
 #[derive(Debug)]
 struct SPMCBufferSharedState<T: Clone + PartialEq + Send> {
@@ -487,7 +487,7 @@ const SHARED_INDEX_MASK:       SharedIndex = 0b1111_1100_0000_0000;
 const SHARED_INDEX_MULTIPLIER: SharedIndex = 0b0000_0100_0000_0000;
 //
 const MAX_BUFFERS: usize = SHARED_INDEX_MASK / SHARED_INDEX_MULTIPLIER + 1;
-const MAX_CONCURRENT_READERS: usize = MAX_BUFFERS / 2 - 1;
+const MAX_READ_BUFFERS: usize = MAX_BUFFERS - 2;
 
 
 /// Unit tests
@@ -510,7 +510,7 @@ mod tests {
         test_initialization(1);
 
         // Test for maximal amount of concurrent readers
-        test_initialization(::MAX_CONCURRENT_READERS);
+        test_initialization(::MAX_READ_BUFFERS);
     }
 
     /// Check that SPMC buffer initialization panics if too many readers are
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn too_many_readers() {
-        test_initialization(::MAX_CONCURRENT_READERS + 1);
+        test_initialization(::MAX_READ_BUFFERS + 1);
     }
 
     /// Check that writing to an SPMC buffer works, but can be blocking
@@ -781,16 +781,16 @@ mod tests {
     }
 
     /// Try initializing a buffer for some maximal wait-free readout concurrency
-    fn test_initialization(wf_conc_readers: usize) {
+    fn test_initialization(read_buffers: usize) {
         // Create a buffer with the requested wait-free read concurrency
-        let buf = ::SPMCBuffer::new(wf_conc_readers, 42);
+        let buf = ::SPMCBuffer::new(read_buffers, 42);
 
         // Access the shared state
         let ref buf_shared = *buf.input.shared;
 
         // Check that we have an appropriate amount of buffers
         let num_buffers = buf_shared.buffers.len();
-        assert_eq!(num_buffers, 2 * (1 + wf_conc_readers));
+        assert_eq!(num_buffers, 2 + read_buffers);
 
         // Decode and check the latest buffer metadata: we should have one
         // reader, no refcount overflow, and a valid latest buffer index
