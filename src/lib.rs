@@ -34,6 +34,8 @@
 
 #![deny(missing_docs)]
 
+extern crate testbench;
+
 use std::cell::UnsafeCell;
 use std::ops::BitAnd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -494,10 +496,11 @@ const MAX_READ_BUFFERS: usize = MAX_BUFFERS - 2;
 #[cfg(test)]
 mod tests {
     use std::ops::BitAnd;
-    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::sync::atomic::Ordering;
-    use std::thread::{self, JoinHandle};
+    use std::thread;
     use std::time::Duration;
+    use testbench;
 
     /// Check that SPMC buffers are properly initialized as long as the
     /// requested amount of concurrent readers stays in implementation limits.
@@ -840,11 +843,10 @@ mod tests {
         // as two readers continuously read the latest value
         const TEST_WRITE_COUNT: u64 = 5000;
 
-        // Create a concurrent test fixture
-        let fixture = ConcurrentTestFixture::new(wait_free_regime);
-
         // Run the concurrent test
-        fixture.run_test(
+        run_concurrent_test(
+            wait_free_regime,
+            0u64,
             |mut buf_input: ::SPMCBufferInput<u64>| {
                 // The writer continuously increments the buffered value, with
                 // some rate limiting to ensure the reader can see the updates
@@ -875,11 +877,10 @@ mod tests {
         // as two readers continuously read the latest value
         const TEST_WRITE_COUNT: u64 = 20_000_000;
 
-        // Create a concurrent test fixture
-        let fixture = ConcurrentTestFixture::new(wait_free_regime);
-
         // Run the concurrent test
-        fixture.run_test(
+        run_concurrent_test(
+            wait_free_regime,
+            0u64,
             |mut buf_input: ::SPMCBufferInput<u64>| {
                 // The writer increments the buffered value as fast as possible
                 for value in 1..(TEST_WRITE_COUNT + 1) {
@@ -900,90 +901,31 @@ mod tests {
         );
     }
 
-    // This test fixture is shared by all concurrent access tests, rate-limited
-    // and rate-unlimited alike
-    struct ConcurrentTestFixture {
-        /// Required test setup for the writer
-        w_fixture: Option<(::SPMCBufferInput<u64>, Arc<Barrier>)>,
+    // Run a concurrent test with one producer and two consumers
+    fn run_concurrent_test<T, P, C>(wait_free_regime: bool,
+                                    initial: T,
+                                    producer: P,
+                                    consumer: C)
+        where T: Clone + PartialEq + Send + 'static,
+              P: FnOnce(::SPMCBufferInput<T>) + Send + 'static,
+              C: Fn(::SPMCBufferOutput<T>) + Send + Sync + 'static
+    {
+        // Create an SPMC buffer with appropriate dimensions and initial content
+        let wf_conc_readers = if wait_free_regime { 2 } else { 0 };
+        let buffer = ::SPMCBuffer::new(wf_conc_readers, initial);
 
-        /// Required test setup for the readers
-        r1_fixture: Option<(::SPMCBufferOutput<u64>, Arc<Barrier>)>,
-        r2_fixture: Option<(::SPMCBufferOutput<u64>, Arc<Barrier>)>,
-    }
-    //
-    impl ConcurrentTestFixture {
-        // Initialize the concurrent text fixture
-        pub fn new(wait_free_regime: bool) -> Self {
-            // Create an SPMC buffer with appropriate dimensions
-            let wf_conc_readers = if wait_free_regime { 2 } else { 0 };
-            let buf = ::SPMCBuffer::new(wf_conc_readers, 0u64);
+        // Split the buffer into one input and two outputs
+        let (buf_input, buf_output1) = buffer.split();
+        let buf_output2 = buf_output1.clone();
 
-            // Extract the input stage so that we can send it to the writer
-            let (buf_input, buf_output) = buf.split();
+        // Setup movable closures for the consumer threads
+        let consumer1 = Arc::new(consumer);
+        let consumer2 = consumer1.clone();
 
-            // Setup a barrier to synchronize reader and writer startup
-            let barrier = Arc::new(Barrier::new(3));
-
-            // Return a complete test fixture
-            ConcurrentTestFixture {
-                w_fixture: Some((buf_input, barrier.clone())),
-                r1_fixture: Some((buf_output.clone(), barrier.clone())),
-                r2_fixture: Some((buf_output, barrier)),
-            }
-        }
-
-        // Consume the test fixture, running a test with the proposed reader
-        // and writer algorithms.
-        pub fn run_test<W, R>(mut self, writer_func: W, reader_func: R)
-            where W: Fn(::SPMCBufferInput<u64>) + Send + 'static,
-                  R: Fn(::SPMCBufferOutput<u64>) + Send + Sync + 'static
-        {
-            // Schedule the writer thread
-            let writer = self.schedule_writer(writer_func);
-
-            // Setup movable closures for the reader threads
-            let r1_closure = Arc::new(reader_func);
-            let r2_closure = r1_closure.clone();
-
-            // Schedule one reader and run the other synchronously
-            let reader1 = self.schedule_reader1(r1_closure);
-            self.run_reader2(r2_closure);
-
-            // Wait for the writer and the asynchronous reader to finish
-            writer.join().unwrap();
-            reader1.join().unwrap();
-        }
-
-        // Schedule the writer thread
-        fn schedule_writer<F>(&mut self, writer: F) -> JoinHandle<()>
-            where F: Fn(::SPMCBufferInput<u64>) + Send + 'static
-        {
-            let (buf_input, barrier) = self.w_fixture.take().unwrap();
-            thread::spawn(move || {
-                              barrier.wait();
-                              writer(buf_input)
-                          })
-        }
-
-        // Schedule the first reader thread
-        fn schedule_reader1<F>(&mut self, reader: Arc<F>) -> JoinHandle<()>
-            where F: Fn(::SPMCBufferOutput<u64>) + Send + Sync + 'static
-        {
-            let (buf_output, barrier) = self.r1_fixture.take().unwrap();
-            thread::spawn(move || {
-                              barrier.wait();
-                              reader(buf_output)
-                          })
-        }
-
-        // Run the second reader synchronously
-        fn run_reader2<F>(&mut self, reader: Arc<F>)
-            where F: Fn(::SPMCBufferOutput<u64>)
-        {
-            let (buf_output, barrier) = self.r2_fixture.take().unwrap();
-            barrier.wait();
-            reader(buf_output);
-        }
+        // Run the concurrent test
+        testbench::concurrent_test_3(move || producer(buf_input),
+                                     move || consumer1(buf_output1),
+                                     move || consumer2(buf_output2));
     }
 }
 
@@ -1001,21 +943,17 @@ mod tests {
 ///
 #[cfg(test)]
 mod benchmarks {
-    use std::sync::{Arc, Barrier};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread::{self, JoinHandle};
-    use std::time::Instant;
+    use testbench;
 
     /// Benchmark for clean read performance
     #[test]
     #[ignore]
-    #[allow(unused_variables)]
     fn clean_read() {
         // Create a buffer
         let mut buf = ::SPMCBuffer::new(1, 0u32);
 
         // Benchmark clean reads
-        benchmark(3_000_000_000u32, |iter| {
+        testbench::benchmark(3_000_000_000u32, || {
             let read = *buf.output.read();
             assert!(read < u32::max_value());
         });
@@ -1029,7 +967,11 @@ mod benchmarks {
         let mut buf = ::SPMCBuffer::new(1, 0u32);
 
         // Benchmark writes
-        benchmark(300_000_000u32, |iter| buf.input.write(iter));
+        let mut iter = 1u32;
+        testbench::benchmark(300_000_000u32, || {
+            buf.input.write(iter);
+            iter += 1;
+        });
     }
 
     /// Benchmark for write + dirty read performance
@@ -1040,8 +982,10 @@ mod benchmarks {
         let mut buf = ::SPMCBuffer::new(1, 0u32);
 
         // Benchmark writes + dirty reads
-        benchmark(140_000_000u32, |iter| {
+        let mut iter = 1u32;
+        testbench::benchmark(140_000_000u32, || {
             buf.input.write(iter);
+            iter += 1;
             let read = *buf.output.read();
             assert!(read < u32::max_value());
         });
@@ -1050,26 +994,24 @@ mod benchmarks {
     /// Benchmark read performance under concurrent write pressure
     #[test]
     #[ignore]
-    #[allow(unused_variables)]
     fn concurrent_read() {
         // Create a buffer
         let buf = ::SPMCBuffer::new(1, 0u32);
         let (mut buf_input, mut buf_output) = buf.split();
 
-        // Create a concurrent benchmark fixture
-        let mut fixture = ConcurrentBenchFixture::new();
-
         // Benchmark reads under concurrent write pressure
         let mut counter = 0u32;
-        fixture.run_benchmark(80_000_000u32,
-                              move |iter| {
-                                  let read = *buf_output.read();
-                                  assert!(read < u32::max_value());
-                              },
-                              move || {
-                                  buf_input.write(counter);
-                                  counter = 1u32.wrapping_sub(counter);
-                              });
+        testbench::concurrent_benchmark(
+            80_000_000u32,
+            move || {
+                let read = *buf_output.read();
+                assert!(read < u32::max_value());
+            },
+            move || {
+                buf_input.write(counter);
+                counter = (counter + 1) % u32::max_value();
+            }
+        );
     }
 
     /// Benchmark write performance under concurrent read pressure
@@ -1080,103 +1022,18 @@ mod benchmarks {
         let buf = ::SPMCBuffer::new(1, 0u32);
         let (mut buf_input, mut buf_output) = buf.split();
 
-        // Create a concurrent benchmark fixture
-        let mut fixture = ConcurrentBenchFixture::new();
-
         // Benchmark writes under concurrent read pressure
-        fixture.run_benchmark(30_000_000u32,
-                              move |iter| { buf_input.write(iter); },
-                              move || {
-                                  let read = *buf_output.read();
-                                  assert!(read < u32::max_value());
-                              });
-    }    
-
-    /// Simple benchmark harness while I'm waiting for #[bench] to stabilize
-    fn benchmark<F: FnMut(u32)>(num_iterations: u32, mut iteration: F) {
-        // Run benchmark loop
-        let start_time = Instant::now();
-        for iter in 1..num_iterations {
-            iteration(iter)
-        }
-        let total_duration = start_time.elapsed();
-
-        // Put results in readable units
-        let total_ms = (total_duration.as_secs() as u32) * 1000 +
-                       total_duration.subsec_nanos() / 1000000;
-        let iter_ns = (total_duration / num_iterations).subsec_nanos();
-
-        // Display the results
-        print!("{} ms ({} iters, ~{} ns/iter): ",
-               total_ms,
-               num_iterations,
-               iter_ns + 1);
-    }
-
-    /// This benchmark fixture is shared by all concurrent benchmarks, it serves
-    /// as a way to schedule some "antagonistic" task in a loop in the
-    /// background as the benchmark proceeds in the main thread.
-    /// runs in the foreground.
-    struct ConcurrentBenchFixture {
-        // Required setup for the task being benchmarked
-        b_fixture: (Arc<Barrier>, Arc<AtomicBool>),
-
-        // Required setup for the antagonist task
-        a_fixture: Option<(Arc<Barrier>, Arc<AtomicBool>)>,
-    }
-    //
-    impl ConcurrentBenchFixture {
-        // Initialize the concurrent benchmark fixture
-        pub fn new() -> Self {
-            // Setup a barrier to synchronize benchmark and antagonist startup
-            let barrier = Arc::new(Barrier::new(2));
-
-            // Setup an atomic "continue" flag to shut down the antagonist at
-            // the end of the benchmarking procedure
-            let run_flag = Arc::new(AtomicBool::new(true));
-
-            // Return a complete benchmarking fixture
-            ConcurrentBenchFixture {
-                b_fixture: (barrier.clone(), run_flag.clone()),
-                a_fixture: Some((barrier, run_flag)),
+        let mut iter = 1u32;
+        testbench::concurrent_benchmark(
+            30_000_000u32,
+            move || {
+                buf_input.write(iter);
+                iter += 1;
+            },
+            move || {
+                let read = *buf_output.read();
+                assert!(read < u32::max_value());
             }
-        }
-
-        // Run the concurrent benchmark
-        fn run_benchmark<F, A>(&mut self,
-                               num_iterations: u32,
-                               iteration_func: F,
-                               antagonist_func: A)
-            where F: FnMut(u32),
-                  A: FnMut() + Send + 'static
-        {
-            // Schedule the antagonist
-            let antagonist = self.schedule_antagonist(antagonist_func);
-
-            // Wait for the antagonist to be running
-            let (ref barrier, ref run_flag) = self.b_fixture;
-            barrier.wait();
-
-            // Run the benchmark
-            benchmark(num_iterations, iteration_func);
-
-            // Stop the antagonist
-            run_flag.store(false, Ordering::Relaxed);
-            antagonist.join().unwrap();
-        }
-
-        // Schedule the antagonist thread, which will run a certain operation
-        // in a loop until the benchmark is finished
-        fn schedule_antagonist<F>(&mut self, mut operation: F) -> JoinHandle<()>
-            where F: FnMut() + Send + 'static
-        {
-            let (barrier, run_flag) = self.a_fixture.take().unwrap();
-            thread::spawn(move || {
-                              barrier.wait();
-                              while run_flag.load(Ordering::Relaxed) {
-                                  operation();
-                              }
-                          })
-        }
+        );
     }
 }

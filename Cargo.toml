@@ -1,22 +1,14 @@
 [package]
-
 name = "spmc_buffer"
-
 version = "0.3.0"
-
 authors = ["Hadrien G. <knights_of_ni@gmx.com>"]
-
 description = "An extension of triple buffering for multiple-consumer scenarios, useful for sharing frequently updated data between threads"
-
 documentation = "https://docs.rs/spmc_buffer/"
 repository = "https://github.com/HadrienG2/spmc-buffer"
-
 readme = "README.md"
-
 keywords = [ "synchronization", "spmc", "multithreading", "non-blocking", "wait-free" ]
-
 categories = [ "algorithms", "asynchronous", "concurrency", "data-structures" ]
-
 license = "LGPL-3.0"
 
 [dependencies]
+testbench = "^0"
