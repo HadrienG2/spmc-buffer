@@ -40,6 +40,7 @@ use std::cell::UnsafeCell;
 use std::ops::BitAnd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 /// A single-producer multiple-consumer buffer, useful for thread-safe data
 /// sharing in scenarios where triple buffering won't cut it.
@@ -179,8 +180,8 @@ impl<T: Clone + PartialEq + Send> SPMCBufferInput<T> {
         // This loop will finish in a finite amount of iterations if each thread
         // is allocated two private buffers, because readers can hold at most
         // two buffers simultaneously. With less buffers, we may need to wait.
-        let mut write_pos: Option<usize> = None;
-        while write_pos == None {
+        let write_idx: usize;
+        loop {
             // We want to iterate over both buffers and associated refcounts
             let mut buf_rc_iter =
                 shared_state.buffers.iter().zip(self.reader_counts.iter());
@@ -189,15 +190,23 @@ impl<T: Clone + PartialEq + Send> SPMCBufferInput<T> {
             // readers have all moved on to more recent data. We identify
             // unreachable buffers by having previously tagged the latest buffer
             // with an infinite reference count.
-            write_pos =
+            let write_pos =
                 buf_rc_iter.position(|tuple| {
                                         let (buffer, refcount) = tuple;
                                         *refcount == 
                                         buffer.done_readers
                                               .load(Ordering::Relaxed)
                                      });
+
+            // If we found a free buffer, we can use it now. Otherwise, we may
+            // want to leave client threads some time to work before spinning.
+            if let Some(idx) = write_pos {
+                write_idx = idx;
+                break;
+            } else {
+                thread::yield_now();
+            }
         }
-        let write_idx = write_pos.unwrap();
 
         // The buffer that we just obtained has been freed by old readers and is
         // unreachable by new readers, so we can safely allocate it as a write
