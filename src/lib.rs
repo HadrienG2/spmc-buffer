@@ -850,7 +850,7 @@ mod tests {
     fn test_rate_limited_writes(wait_free_regime: bool) {
         // We will stress the infrastructure by performing this many writes
         // as two readers continuously read the latest value
-        const TEST_WRITE_COUNT: u64 = 1_250;
+        const TEST_WRITE_COUNT: u64 = 500;
 
         // Run the concurrent test
         run_concurrent_test(
@@ -862,7 +862,7 @@ mod tests {
                 for value in 1..(TEST_WRITE_COUNT + 1) {
                     buf_input.write(value);
                     thread::yield_now();
-                    thread::sleep(Duration::from_millis(4));
+                    thread::sleep(Duration::from_millis(16));
                 }
             },
             |mut buf_output: ::SPMCBufferOutput<u64>| {
