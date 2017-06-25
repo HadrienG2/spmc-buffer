@@ -512,6 +512,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use testbench;
+    use testbench::race_cell::{Racey, UsizeRaceCell};
 
     /// Check that SPMC buffers are properly initialized as long as the
     /// requested amount of concurrent readers stays in implementation limits.
@@ -852,30 +853,37 @@ mod tests {
     fn test_rate_limited_writes(wait_free_regime: bool) {
         // We will stress the infrastructure by performing this many writes
         // as two readers continuously read the latest value
-        const TEST_WRITE_COUNT: u64 = 500;
+        const TEST_WRITE_COUNT: usize = 500;
 
         // Run the concurrent test
         run_concurrent_test(
             wait_free_regime,
-            0u64,
-            |mut buf_input: ::SPMCBufferInput<u64>| {
+            UsizeRaceCell::new(0),
+            |mut buf_input: ::SPMCBufferInput<UsizeRaceCell>| {
                 // The writer continuously increments the buffered value, with
                 // some rate limiting to ensure the reader can see the updates
                 for value in 1..(TEST_WRITE_COUNT + 1) {
-                    buf_input.write(value);
+                    buf_input.write(UsizeRaceCell::new(value));
                     thread::yield_now();
                     thread::sleep(Duration::from_millis(16));
                 }
             },
-            |mut buf_output: ::SPMCBufferOutput<u64>| {
+            |mut buf_output: ::SPMCBufferOutput<UsizeRaceCell>| {
                 // The readers continuously check the buffered value, and should
                 // see every update without any incoherent value in the middle
-                let mut last_value = 0u64;
+                let mut last_value = 0usize;
                 while last_value != TEST_WRITE_COUNT {
-                    let new_value = *buf_output.read();
-                    assert!((new_value >= last_value) &&
-                            (new_value - last_value <= 1));
-                    last_value = new_value;
+                    let new_racey_value = buf_output.read().get();
+                    match new_racey_value {
+                        Racey::Consistent(new_value) => {
+                            assert!((new_value >= last_value) &&
+                                    (new_value - last_value <= 1));
+                            last_value = new_value;
+                        }
+                        Racey::Inconsistent => {
+                            panic!("Inconsistent state exposed by the buffer!");
+                        }
+                    }
                 }
             }
         );
@@ -886,27 +894,34 @@ mod tests {
     fn test_max_rate_writes(wait_free_regime: bool) {
         // We will stress the infrastructure by performing this many writes
         // as two readers continuously read the latest value
-        const TEST_WRITE_COUNT: u64 = 20_000_000;
+        const TEST_WRITE_COUNT: usize = 20_000_000;
 
         // Run the concurrent test
         run_concurrent_test(
             wait_free_regime,
-            0u64,
-            |mut buf_input: ::SPMCBufferInput<u64>| {
+            UsizeRaceCell::new(0),
+            |mut buf_input: ::SPMCBufferInput<UsizeRaceCell>| {
                 // The writer increments the buffered value as fast as possible
                 for value in 1..(TEST_WRITE_COUNT + 1) {
-                    buf_input.write(value);
+                    buf_input.write(UsizeRaceCell::new(value));
                 }
             },
-            |mut buf_output: ::SPMCBufferOutput<u64>| {
+            |mut buf_output: ::SPMCBufferOutput<UsizeRaceCell>| {
                 // The readers continuously check the buffered value, and should
                 // not spot any garbage value slipping in the middle
-                let mut last_value = 0u64;
+                let mut last_value = 0usize;
                 while last_value != TEST_WRITE_COUNT {
-                    let new_value = *buf_output.read();
-                    assert!((new_value >= last_value) &&
-                            (new_value <= TEST_WRITE_COUNT));
-                    last_value = new_value;
+                    let new_racey_value = buf_output.read().get();
+                    match new_racey_value {
+                        Racey::Consistent(new_value) => {
+                            assert!((new_value >= last_value) &&
+                                    (new_value <= TEST_WRITE_COUNT));
+                            last_value = new_value;
+                        }
+                        Racey::Inconsistent => {
+                            panic!("Inconsistent state exposed by the buffer!");
+                        }
+                    }
                 }
             }
         );
