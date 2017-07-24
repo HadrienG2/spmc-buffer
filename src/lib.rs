@@ -775,13 +775,10 @@ mod tests {
     #[ignore]
     fn uncontended_concurrent_access() {
         // Try it in the triple-buffering regime
-        println!("DB...");
         test_rate_limited_writes(false);
 
         // Try it in the wait-free regime
-        println!("WF...");
         test_rate_limited_writes(true);
-        println!("OK!");
     }
 
     /// Check that contended reads and writes work
@@ -792,13 +789,10 @@ mod tests {
     #[ignore]
     fn contended_concurrent_access() {
         // Try it in the triple-buffering regime
-        println!("DB...");
         test_max_rate_writes(false);
 
         // Try it in the wait-free regime
-        println!("WF...");
         test_max_rate_writes(true);
-        println!("OK!");
     }
 
     /// Try initializing a buffer for some maximal wait-free readout concurrency
