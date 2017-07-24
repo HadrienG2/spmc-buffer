@@ -775,8 +775,8 @@ mod tests {
     #[ignore]
     fn uncontended_concurrent_access() {
         // Try it in the double-buffering regime
-        println!("DB...");
-        test_rate_limited_writes(false);
+        /* println!("DB...");
+        test_rate_limited_writes(false); */
 
         // Try it in the wait-free regime
         println!("WF...");
@@ -792,8 +792,8 @@ mod tests {
     #[ignore]
     fn contended_concurrent_access() {
         // Try it in the double-buffering regime
-        println!("DB...");
-        test_max_rate_writes(false);
+        /* println!("DB...");
+        test_max_rate_writes(false); */
 
         // Try it in the wait-free regime
         println!("WF...");
