@@ -859,7 +859,7 @@ mod tests {
     fn test_rate_limited_writes(wait_free_regime: bool) {
         // We will stress the infrastructure by performing this many writes
         // as two readers continuously read the latest value
-        const TEST_WRITE_COUNT: usize = 500;
+        const TEST_WRITE_COUNT: usize = 250;
 
         // Run the concurrent test
         run_concurrent_test(
@@ -871,7 +871,7 @@ mod tests {
                 for value in 1..(TEST_WRITE_COUNT + 1) {
                     buf_input.write(UsizeRaceCell::new(value));
                     thread::yield_now();
-                    thread::sleep(Duration::from_millis(16));
+                    thread::sleep(Duration::from_millis(32));
                 }
             },
             |mut buf_output: ::SPMCBufferOutput<UsizeRaceCell>| {
