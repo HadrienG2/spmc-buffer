@@ -774,9 +774,9 @@ mod tests {
     #[test]
     #[ignore]
     fn uncontended_concurrent_access() {
-        // Try it in the double-buffering regime
-        /* println!("DB...");
-        test_rate_limited_writes(false); */
+        // Try it in the triple-buffering regime
+        println!("DB...");
+        test_rate_limited_writes(false);
 
         // Try it in the wait-free regime
         println!("WF...");
@@ -791,9 +791,9 @@ mod tests {
     #[test]
     #[ignore]
     fn contended_concurrent_access() {
-        // Try it in the double-buffering regime
-        /* println!("DB...");
-        test_max_rate_writes(false); */
+        // Try it in the triple-buffering regime
+        println!("DB...");
+        test_max_rate_writes(false);
 
         // Try it in the wait-free regime
         println!("WF...");
@@ -943,7 +943,7 @@ mod tests {
               C: Fn(::SPMCBufferOutput<T>) + Send + Sync + 'static
     {
         // Create an SPMC buffer with appropriate dimensions and initial content
-        let wf_conc_readers = if wait_free_regime { 2 } else { 0 };
+        let wf_conc_readers = if wait_free_regime { 2 } else { 1 };
         let buffer = ::SPMCBuffer::new(wf_conc_readers, initial);
 
         // Split the buffer into one input and two outputs
