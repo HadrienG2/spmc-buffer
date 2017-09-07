@@ -202,6 +202,8 @@ impl<T: Clone + Send> SPMCBufferInput<T> {
             // want to leave client threads some time to work before spinning.
             if let Some(idx) = write_pos {
                 write_idx = idx;
+                // TODO: Rewrite this using the new "break <value>;" syntax once
+                //       Rust 1.19 is mainstream enough
                 break;
             } else {
                 thread::yield_now();
