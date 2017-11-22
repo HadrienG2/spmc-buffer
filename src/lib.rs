@@ -405,13 +405,12 @@ impl<T: PartialEq + Send + Sync> SPMCBufferSharedState<T> {
     /// Share state equality is unsafe much like buffer equality is unsafe
     unsafe fn eq(&self, other: &Self) -> bool {
         // Determine whether the contents of all buffers are equal
-        let buffers_equal = self.buffers
-            .iter()
-            .zip(other.buffers.iter())
-            .all(|tuple| -> bool {
-                     let (buf1, buf2) = tuple;
-                     buf1.eq(buf2)
-                 });
+        let buffers_equal = self.buffers.iter()
+                                        .zip(other.buffers.iter())
+                                        .all(|tuple| -> bool {
+                                                 let (buf1, buf2) = tuple;
+                                                 buf1.eq(buf2)
+                                             });
 
         // Use that to deduce if the entire shared state is equivalent
         buffers_equal &&
