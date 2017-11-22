@@ -12,7 +12,7 @@
 //! # Examples
 //!
 //! ```
-//! // Create an SPMC buffer of any Clone type
+//! // Create an SPMC buffer with some initial contents
 //! use spmc_buffer::SPMCBuffer;
 //! let buf = SPMCBuffer::new(2, 1.0);
 //!
@@ -59,7 +59,7 @@ use std::thread;
 /// the producer. I call the resulting synchronization primitive an SPMC buffer.
 ///
 #[derive(Debug)]
-pub struct SPMCBuffer<T: Clone + Send + Sync> {
+pub struct SPMCBuffer<T: Send + Sync> {
     /// Input object used by the producer to send updates
     input: SPMCBufferInput<T>,
 
@@ -72,21 +72,42 @@ impl<T: Clone + Send + Sync> SPMCBuffer<T> {
     /// roughly determines how many readers can be accessing the structure at
     /// a slow pace before the writer starts to block).
     pub fn new(read_buffers: usize, initial: T) -> Self {
+        Self::new_impl(read_buffers, || initial.clone())
+    }
+}
+//
+impl<T: Default + Send + Sync> SPMCBuffer<T> {
+    /// Like "new", but uses default-constructed values of type T instead of
+    /// cloning a user-provided initial value of this type.
+    pub fn with_default(read_buffers: usize) -> Self {
+        Self::new_impl(read_buffers, || T::default())
+    }
+}
+//
+impl<T: Send + Sync> SPMCBuffer<T> {
+    /// Construct a triple buffer, using a functor to generate initial values
+    fn new_impl<F>(read_buffers: usize, mut generator: F) -> Self
+        where F: FnMut() -> T
+    {
         // Check that the amount of read buffers fits implementation limits
         assert!(read_buffers <= MAX_READ_BUFFERS);
 
         // Compute the actual buffer count
         let num_buffers = 2 + read_buffers;
 
+        // Build the buffers, using the provided generator of initial data
+        let buffers =
+            (0..num_buffers).map(|_| Buffer {
+                                         data: UnsafeCell::new(generator()),
+                                         done_readers: AtomicRefCount::new(0),
+                                 })
+                            .collect();
+
         // Create the shared state. Buffer 0 is initially considered the latest,
         // and has one reader accessing it (corresponding to a refcount of 1).
         let shared_state =
             Arc::new(SPMCBufferSharedState {
-                         buffers: vec![Buffer {
-                                           data: UnsafeCell::new(initial),
-                                           done_readers: AtomicRefCount::new(0),
-                                       };
-                                       num_buffers],
+                         buffers,
                          latest_info: AtomicSharedIndex::new(1),
                      });
 
@@ -138,7 +159,7 @@ impl<T: Clone + Send + Sync> Clone for SPMCBuffer<T> {
     }
 }
 //
-impl<T: Clone + PartialEq + Send + Sync> PartialEq for SPMCBuffer<T> {
+impl<T: PartialEq + Send + Sync> PartialEq for SPMCBuffer<T> {
     fn eq(&self, other: &Self) -> bool {
         // Compare the shared states. This is safe because at this layer of the
         // interface, one needs an Input/Output &mut to mutate the shared state.
@@ -160,7 +181,7 @@ impl<T: Clone + PartialEq + Send + Sync> PartialEq for SPMCBuffer<T> {
 /// on the buffer size and the readout pattern.
 ///
 #[derive(Debug)]
-pub struct SPMCBufferInput<T: Clone + Send + Sync> {
+pub struct SPMCBufferInput<T: Send + Sync> {
     /// Reference-counted shared state
     shared: Arc<SPMCBufferSharedState<T>>,
 
@@ -170,7 +191,7 @@ pub struct SPMCBufferInput<T: Clone + Send + Sync> {
     reader_counts: Vec<RefCount>,
 }
 //
-impl<T: Clone + Send + Sync> SPMCBufferInput<T> {
+impl<T: Send + Sync> SPMCBufferInput<T> {
     /// Write a new value into the SPMC buffer
     pub fn write(&mut self, value: T) {
         // Access the shared state
@@ -254,7 +275,7 @@ impl<T: Clone + Send + Sync> SPMCBufferInput<T> {
 /// slowdown, but deadlocks and scheduling-induced slowdowns cannot happen.
 ///
 #[derive(Debug)]
-pub struct SPMCBufferOutput<T: Clone + Send + Sync> {
+pub struct SPMCBufferOutput<T: Send + Sync> {
     /// Reference-counted shared state
     shared: Arc<SPMCBufferSharedState<T>>,
 
@@ -262,7 +283,7 @@ pub struct SPMCBufferOutput<T: Clone + Send + Sync> {
     read_idx: BufferIndex,
 }
 //
-impl<T: Clone + Send + Sync> SPMCBufferOutput<T> {
+impl<T: Send + Sync> SPMCBufferOutput<T> {
     /// Access the latest value from the SPMC buffer
     pub fn read(&mut self) -> &T {
         // Access the shared state
@@ -311,7 +332,7 @@ impl<T: Clone + Send + Sync> SPMCBufferOutput<T> {
     }
 }
 //
-impl<T: Clone + Send + Sync> Clone for SPMCBufferOutput<T> {
+impl<T: Send + Sync> Clone for SPMCBufferOutput<T> {
     // Create a new output interface associated with a given SPMC buffer
     fn clone(&self) -> Self {
         // Clone the current shared state
@@ -335,7 +356,7 @@ impl<T: Clone + Send + Sync> Clone for SPMCBufferOutput<T> {
     }
 }
 //
-impl<T: Clone + Send + Sync> Drop for SPMCBufferOutput<T> {
+impl<T: Send + Sync> Drop for SPMCBufferOutput<T> {
     // Discard our read buffer on thread exit
     fn drop(&mut self) {
         // We must use release ordering here in order to prevent preceding
@@ -367,7 +388,7 @@ impl<T: Clone + Send + Sync> Drop for SPMCBufferOutput<T> {
 /// just use more buffers if writer contention starts to be problematic.
 ///
 #[derive(Debug)]
-struct SPMCBufferSharedState<T: Clone + Send + Sync> {
+struct SPMCBufferSharedState<T: Send + Sync> {
     /// Data storage buffers
     buffers: Vec<Buffer<T>>,
 
@@ -376,11 +397,11 @@ struct SPMCBufferSharedState<T: Clone + Send + Sync> {
 }
 //
 impl<T: Clone + Send + Sync> SPMCBufferSharedState<T> {
-    /// Cloning the shared state is unsafe because you must ensure that no one
-    /// is concurrently accessing it, since &self is enough for writing.
+    /// Cloning the shared state is unsafe much like cloning a buffer is unsafe
     unsafe fn clone(&self) -> Self {
+        let buffers = self.buffers.iter().map(|b| b.clone()).collect();
         SPMCBufferSharedState {
-            buffers: self.buffers.clone(),
+            buffers,
             latest_info: AtomicSharedIndex::new(
                 self.latest_info.load(Ordering::Relaxed)
             ),
@@ -388,20 +409,16 @@ impl<T: Clone + Send + Sync> SPMCBufferSharedState<T> {
     }
 }
 //
-impl<T: Clone + PartialEq + Send + Sync> SPMCBufferSharedState<T> {
-    /// Equality is unsafe for the same reason as cloning: you must ensure that
-    /// no one is concurrently accessing the triple buffer to avoid data races.
+impl<T: PartialEq + Send + Sync> SPMCBufferSharedState<T> {
+    /// Share state equality is unsafe much like buffer equality is unsafe
     unsafe fn eq(&self, other: &Self) -> bool {
         // Determine whether the contents of all buffers are equal
-        let buffers_equal = self.buffers
-            .iter()
-            .zip(other.buffers.iter())
-            .all(|tuple| -> bool {
-                     let (buf1, buf2) = tuple;
-                     let dr1 = buf1.done_readers.load(Ordering::Relaxed);
-                     let dr2 = buf2.done_readers.load(Ordering::Relaxed);
-                     (*buf1.data.get() == *buf2.data.get()) && (dr1 == dr2)
-                 });
+        let buffers_equal = self.buffers.iter()
+                                        .zip(other.buffers.iter())
+                                        .all(|tuple| -> bool {
+                                                 let (buf1, buf2) = tuple;
+                                                 buf1.eq(buf2)
+                                             });
 
         // Use that to deduce if the entire shared state is equivalent
         buffers_equal &&
@@ -410,11 +427,11 @@ impl<T: Clone + PartialEq + Send + Sync> SPMCBufferSharedState<T> {
     }
 }
 //
-unsafe impl<T: Clone + Send + Sync> Sync for SPMCBufferSharedState<T> {}
+unsafe impl<T: Send + Sync> Sync for SPMCBufferSharedState<T> {}
 //
 //
 #[derive(Debug)]
-struct Buffer<T: Clone + Send + Sync> {
+struct Buffer<T: Send + Sync> {
     /// Actual data must be in an UnsafeCell so that Rust knows it's mutable
     data: UnsafeCell<T>,
 
@@ -422,18 +439,25 @@ struct Buffer<T: Clone + Send + Sync> {
     done_readers: AtomicRefCount,
 }
 //
-impl<T: Clone + Send + Sync> Clone for Buffer<T> {
-    /// WARNING: Buffers are NOT safe to clone, because a writer might be
-    ///          concurrently writing to them. The only reason why I'm not
-    ///          marking this function as unsafe is Rust would then not accept
-    ///          it as a Clone implementation, which would make Vec manipulation
-    ///          a lot more painful.
-    fn clone(&self) -> Self {
+impl<T: Clone + Send + Sync> Buffer<T> {
+    /// Cloning a buffer is unsafe because you must ensure that no one is
+    /// concurrently writing it, which isn't a given due to internal mutability.
+    unsafe fn clone(&self) -> Self {
         Buffer {
-            data: UnsafeCell::new(unsafe { (*self.data.get()).clone() }),
+            data: UnsafeCell::new((*self.data.get()).clone()),
             done_readers: AtomicRefCount::new(self.done_readers
                                                   .load(Ordering::Relaxed)),
         }
+    }
+}
+//
+impl<T: PartialEq + Send + Sync> Buffer<T> {
+    /// Equality is unsafe for the same reason as cloning: you must ensure that
+    /// no one is concurrently accessing the buffer to avoid data races.
+    unsafe fn eq(&self, other: &Self) -> bool {
+        let dr1 = self.done_readers.load(Ordering::Relaxed);
+        let dr2 = other.done_readers.load(Ordering::Relaxed);
+        (*self.data.get() == *other.data.get()) && (dr1 == dr2)
     }
 }
 
