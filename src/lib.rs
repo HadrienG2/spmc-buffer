@@ -72,21 +72,34 @@ impl<T: Clone + Send + Sync> SPMCBuffer<T> {
     /// roughly determines how many readers can be accessing the structure at
     /// a slow pace before the writer starts to block).
     pub fn new(read_buffers: usize, initial: T) -> Self {
+        Self::new_impl(read_buffers, || initial.clone())
+    }
+}
+//
+impl<T: Send + Sync> SPMCBuffer<T> {
+    /// Construct a triple buffer, using a functor to generate initial values
+    fn new_impl<F>(read_buffers: usize, mut generator: F) -> Self
+        where F: FnMut() -> T
+    {
         // Check that the amount of read buffers fits implementation limits
         assert!(read_buffers <= MAX_READ_BUFFERS);
 
         // Compute the actual buffer count
         let num_buffers = 2 + read_buffers;
 
+        // Build the buffers, using the provided generator of initial data
+        let buffers =
+            (0..num_buffers).map(|_| Buffer {
+                                         data: UnsafeCell::new(generator()),
+                                         done_readers: AtomicRefCount::new(0),
+                                 })
+                            .collect();
+
         // Create the shared state. Buffer 0 is initially considered the latest,
         // and has one reader accessing it (corresponding to a refcount of 1).
         let shared_state =
             Arc::new(SPMCBufferSharedState {
-                         buffers: vec![Buffer {
-                                           data: UnsafeCell::new(initial),
-                                           done_readers: AtomicRefCount::new(0),
-                                       };
-                                       num_buffers],
+                         buffers,
                          latest_info: AtomicSharedIndex::new(1),
                      });
 
@@ -109,9 +122,7 @@ impl<T: Clone + Send + Sync> SPMCBuffer<T> {
         // Return the resulting valid SPMC buffer
         result
     }
-}
-//
-impl<T: Send + Sync> SPMCBuffer<T> {
+
     /// Extract input and output of the SPMC buffer
     pub fn split(self) -> (SPMCBufferInput<T>, SPMCBufferOutput<T>) {
         (self.input, self.output)
