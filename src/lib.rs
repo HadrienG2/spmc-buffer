@@ -76,6 +76,14 @@ impl<T: Clone + Send + Sync> SPMCBuffer<T> {
     }
 }
 //
+impl<T: Default + Send + Sync> SPMCBuffer<T> {
+    /// Like "new", but uses default-constructed values of type T instead of
+    /// cloning a user-provided initial value of this type.
+    pub fn with_default(read_buffers: usize) -> Self {
+        Self::new_impl(read_buffers, || T::default())
+    }
+}
+//
 impl<T: Send + Sync> SPMCBuffer<T> {
     /// Construct a triple buffer, using a functor to generate initial values
     fn new_impl<F>(read_buffers: usize, mut generator: F) -> Self
