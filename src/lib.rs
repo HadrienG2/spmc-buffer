@@ -389,11 +389,11 @@ struct SPMCBufferSharedState<T: Send + Sync> {
 }
 //
 impl<T: Clone + Send + Sync> SPMCBufferSharedState<T> {
-    /// Cloning the shared state is unsafe because you must ensure that no one
-    /// is concurrently accessing it, since &self is enough for writing.
+    /// Cloning the shared state is unsafe much like cloning a buffer is unsafe
     unsafe fn clone(&self) -> Self {
+        let buffers = self.buffers.iter().map(|b| b.clone()).collect();
         SPMCBufferSharedState {
-            buffers: self.buffers.clone(),
+            buffers,
             latest_info: AtomicSharedIndex::new(
                 self.latest_info.load(Ordering::Relaxed)
             ),
@@ -402,8 +402,7 @@ impl<T: Clone + Send + Sync> SPMCBufferSharedState<T> {
 }
 //
 impl<T: PartialEq + Send + Sync> SPMCBufferSharedState<T> {
-    /// Equality is unsafe for the same reason as cloning: you must ensure that
-    /// no one is concurrently accessing the triple buffer to avoid data races.
+    /// Share state equality is unsafe much like buffer equality is unsafe
     unsafe fn eq(&self, other: &Self) -> bool {
         // Determine whether the contents of all buffers are equal
         let buffers_equal = self.buffers
@@ -411,9 +410,7 @@ impl<T: PartialEq + Send + Sync> SPMCBufferSharedState<T> {
             .zip(other.buffers.iter())
             .all(|tuple| -> bool {
                      let (buf1, buf2) = tuple;
-                     let dr1 = buf1.done_readers.load(Ordering::Relaxed);
-                     let dr2 = buf2.done_readers.load(Ordering::Relaxed);
-                     (*buf1.data.get() == *buf2.data.get()) && (dr1 == dr2)
+                     buf1.eq(buf2)
                  });
 
         // Use that to deduce if the entire shared state is equivalent
@@ -435,18 +432,25 @@ struct Buffer<T: Send + Sync> {
     done_readers: AtomicRefCount,
 }
 //
-impl<T: Clone + Send + Sync> Clone for Buffer<T> {
-    /// WARNING: Buffers are NOT safe to clone, because a writer might be
-    ///          concurrently writing to them. The only reason why I'm not
-    ///          marking this function as unsafe is Rust would then not accept
-    ///          it as a Clone implementation, which would make Vec manipulation
-    ///          a lot more painful.
-    fn clone(&self) -> Self {
+impl<T: Clone + Send + Sync> Buffer<T> {
+    /// Cloning a buffer is unsafe because you must ensure that no one is
+    /// concurrently writing it, which isn't a given due to internal mutability.
+    unsafe fn clone(&self) -> Self {
         Buffer {
-            data: UnsafeCell::new(unsafe { (*self.data.get()).clone() }),
+            data: UnsafeCell::new((*self.data.get()).clone()),
             done_readers: AtomicRefCount::new(self.done_readers
                                                   .load(Ordering::Relaxed)),
         }
+    }
+}
+//
+impl<T: PartialEq + Send + Sync> Buffer<T> {
+    /// Equality is unsafe for the same reason as cloning: you must ensure that
+    /// no one is concurrently accessing the buffer to avoid data races.
+    unsafe fn eq(&self, other: &Self) -> bool {
+        let dr1 = self.done_readers.load(Ordering::Relaxed);
+        let dr2 = other.done_readers.load(Ordering::Relaxed);
+        (*self.data.get() == *other.data.get()) && (dr1 == dr2)
     }
 }
 
