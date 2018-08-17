@@ -1,5 +1,7 @@
 # SPMC Buffer: Triple-buffering for multiple consumers
 
+**Maintenance warning: This project has been abandoned in order to make room for others.**
+
 [![On crates.io](https://img.shields.io/crates/v/spmc_buffer.svg)](https://crates.io/crates/spmc_buffer)
 [![On docs.rs](https://docs.rs/spmc_buffer/badge.svg)](https://docs.rs/spmc_buffer/)
 [![Build status](https://travis-ci.org/HadrienG2/spmc-buffer.svg?branch=master)](https://travis-ci.org/HadrienG2/spmc-buffer)
